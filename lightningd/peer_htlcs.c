@@ -229,7 +229,8 @@ static void handle_localpay(struct htlc_in *hin,
 			    u32 outgoing_cltv_value)
 {
 	enum onion_type failcode;
-	const struct invoice *invoice;
+	struct invoice invoice;
+	struct invoice_details details;
 	struct lightningd *ld = hin->key.channel->peer->ld;
 
 	/* BOLT #4:
@@ -260,11 +261,11 @@ static void handle_localpay(struct htlc_in *hin,
 		goto fail;
 	}
 
-	invoice = wallet_invoice_find_unpaid(ld->wallet, payment_hash);
-	if (!invoice) {
+	if (!wallet_invoice_find_unpaid(ld->wallet, &invoice, payment_hash)) {
 		failcode = WIRE_UNKNOWN_PAYMENT_HASH;
 		goto fail;
 	}
+	wallet_invoice_details(tmpctx, ld->wallet, invoice, &details);
 
 	/* BOLT #4:
 	 *
@@ -276,10 +277,10 @@ static void handle_localpay(struct htlc_in *hin,
 	 *
 	 * 1. type: PERM|16 (`incorrect_payment_amount`)
 	 */
-	if (invoice->msatoshi != NULL && hin->msatoshi < *invoice->msatoshi) {
+	if (details.msatoshi != NULL && hin->msatoshi < *details.msatoshi) {
 		failcode = WIRE_INCORRECT_PAYMENT_AMOUNT;
 		goto fail;
-	} else if (invoice->msatoshi != NULL && hin->msatoshi > *invoice->msatoshi * 2) {
+	} else if (details.msatoshi != NULL && hin->msatoshi > *details.msatoshi * 2) {
 		failcode = WIRE_INCORRECT_PAYMENT_AMOUNT;
 		goto fail;
 	}
@@ -300,11 +301,12 @@ static void handle_localpay(struct htlc_in *hin,
 	}
 
 	log_info(ld->log, "Resolving invoice '%s' with HTLC %"PRIu64,
-		 invoice->label, hin->key.id);
+		 details.label, hin->key.id);
 	log_debug(ld->log, "%s: Actual amount %"PRIu64"msat, HTLC expiry %u",
-		  invoice->label, hin->msatoshi, cltv_expiry);
-	fulfill_htlc(hin, &invoice->r);
+		  details.label, hin->msatoshi, cltv_expiry);
+	fulfill_htlc(hin, &details.r);
 	wallet_invoice_resolve(ld->wallet, invoice, hin->msatoshi);
+
 	return;
 
 fail:
@@ -557,7 +559,6 @@ static bool peer_accepted_htlc(struct channel *channel,
 	u8 *req;
 	struct route_step *rs;
 	struct onionpacket *op;
-	const tal_t *tmpctx = tal_tmpctx(channel);
 	struct lightningd *ld = channel->peer->ld;
 
 	hin = find_htlc_in(&ld->htlcs_in, channel, id);
@@ -598,7 +599,6 @@ static bool peer_accepted_htlc(struct channel *channel,
 				   "bad onion in got_revoke: %s",
 				   tal_hexstr(channel, hin->onion_routing_packet,
 					     sizeof(hin->onion_routing_packet)));
-			tal_free(tmpctx);
 			return false;
 		}
 		/* FIXME: could be bad version, bad key. */
@@ -653,7 +653,6 @@ out:
 	log_debug(channel->log, "their htlc %"PRIu64" %s",
 		  id, *failcode ? onion_type_name(*failcode) : "locked");
 
-	tal_free(tmpctx);
 	return true;
 }
 
@@ -799,6 +798,7 @@ void onchain_failed_our_htlc(const struct channel *channel,
 	hout->failcode = WIRE_PERMANENT_CHANNEL_FAILURE;
 
 	if (!hout->in) {
+		assert(why != NULL);
 		char *localfail = tal_fmt(channel, "%s: %s",
 					  onion_type_name(WIRE_PERMANENT_CHANNEL_FAILURE),
 					  why);
@@ -893,8 +893,8 @@ static bool update_out_htlc(struct channel *channel,
 
 		/* For our own HTLCs, we commit payment to db lazily */
 		if (hout->origin_htlc_id == 0)
-			wallet_payment_store(ld->wallet,
-					     &hout->payment_hash);
+			payment_store(ld,
+				      &hout->payment_hash);
 	}
 
 	if (!htlc_out_update_state(channel, hout, newstate))

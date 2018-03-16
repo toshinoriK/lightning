@@ -1,3 +1,4 @@
+#include <bitcoin/script.h>
 #include <common/key_derive.h>
 #include <errno.h>
 #include <inttypes.h>
@@ -48,21 +49,8 @@ static void onchaind_tell_fulfill(struct channel *channel)
 
 static void handle_onchain_init_reply(struct channel *channel, const u8 *msg)
 {
-	u8 state;
-
-	if (!fromwire_onchain_init_reply(msg, &state)) {
-		channel_internal_error(channel, "Invalid onchain_init_reply");
-		return;
-	}
-
-	if (!channel_state_on_chain(state)) {
-		channel_internal_error(channel,
-				    "Invalid onchain_init_reply state %u (%s)",
-				    state, channel_state_str(state));
-		return;
-	}
-
-	channel_set_state(channel, FUNDING_SPEND_SEEN, state);
+	/* FIXME: We may already be ONCHAIN state when we implement restart! */
+	channel_set_state(channel, FUNDING_SPEND_SEEN, ONCHAIN);
 
 	/* Tell it about any preimages we know. */
 	onchaind_tell_fulfill(channel);
@@ -160,7 +148,7 @@ static void handle_onchain_unwatch_tx(struct channel *channel, const u8 *msg)
 	txw = find_txwatch(channel->peer->ld->topology, &txid, channel);
 	if (!txw)
 		log_unusual(channel->log, "Can't unwatch txid %s",
-			    type_to_string(ltmp, struct bitcoin_txid, &txid));
+			    type_to_string(tmpctx, struct bitcoin_txid, &txid));
 	tal_free(txw);
 }
 
@@ -239,6 +227,8 @@ static void onchain_add_utxo(struct channel *channel, const u8 *msg)
 	u->status = output_state_available;
 	u->close_info->channel_id = channel->dbid;
 	u->close_info->peer_id = channel->peer->id;
+	u->blockheight = NULL;
+	u->spendheight = NULL;
 
 	if (!fromwire_onchain_add_utxo(msg, &u->txid, &u->outnum,
 				       &u->close_info->commitment_point,
@@ -250,7 +240,7 @@ static void onchain_add_utxo(struct channel *channel, const u8 *msg)
 	wallet_add_utxo(channel->peer->ld->wallet, u, p2wpkh);
 }
 
-static unsigned int onchain_msg(struct subd *sd, const u8 *msg, const int *fds)
+static unsigned int onchain_msg(struct subd *sd, const u8 *msg, const int *fds UNUSED)
 {
 	enum onchain_wire_type t = fromwire_peektype(msg);
 
@@ -334,31 +324,31 @@ static bool tell_if_missing(const struct channel *channel,
 
 /* Only error onchaind can get is if it dies. */
 static void onchain_error(struct channel *channel,
-			  int peer_fd, int gossip_fd,
-			  const struct crypto_state *cs,
-			  u64 gossip_index,
-			  const struct channel_id *channel_id,
+			  int peer_fd UNUSED, int gossip_fd UNUSED,
+			  const struct crypto_state *cs UNUSED,
+			  u64 gossip_index UNUSED,
+			  const struct channel_id *channel_id UNUSED,
 			  const char *desc,
-			  const u8 *err_for_them)
+			  const u8 *err_for_them UNUSED)
 {
 	/* FIXME: re-launch? */
 	log_broken(channel->log, "%s", desc);
+	channel_set_billboard(channel, true, desc);
+	channel_set_owner(channel, NULL);
 }
 
 /* With a reorg, this can get called multiple times; each time we'll kill
  * onchaind (like any other owner), and restart */
 enum watch_result funding_spent(struct channel *channel,
 				const struct bitcoin_tx *tx,
-				size_t input_num,
+				size_t input_num UNUSED,
 				const struct block *block)
 {
-	u8 *msg, *scriptpubkey;
+	u8 *msg;
 	struct bitcoin_txid our_last_txid;
-	s64 keyindex;
-	struct pubkey ourkey;
 	struct htlc_stub *stubs;
-	const tal_t *tmpctx = tal_tmpctx(channel);
 	struct lightningd *ld = channel->peer->ld;
+	struct pubkey final_key;
 
 	channel_fail_permanent(channel, "Funding transaction spent");
 
@@ -372,51 +362,27 @@ enum watch_result funding_spent(struct channel *channel,
 						    onchain_wire_type_name,
 						    onchain_msg,
 						    onchain_error,
+						    channel_set_billboard,
 						    NULL));
 
 	if (!channel->owner) {
 		log_broken(channel->log, "Could not subdaemon onchain: %s",
 			   strerror(errno));
-		tal_free(tmpctx);
 		return KEEP_WATCHING;
 	}
 
 	stubs = wallet_htlc_stubs(tmpctx, ld->wallet, channel);
 	if (!stubs) {
 		log_broken(channel->log, "Could not load htlc_stubs");
-		tal_free(tmpctx);
 		return KEEP_WATCHING;
 	}
 
-	/* We re-use this key to send other outputs to. */
-	if (channel->local_shutdown_idx >= 0)
-		keyindex = channel->local_shutdown_idx;
-	else {
-		keyindex = wallet_get_newindex(ld);
-		if (keyindex < 0) {
-			log_broken(channel->log, "Could not get keyindex");
-			tal_free(tmpctx);
-			return KEEP_WATCHING;
-		}
+	if (!bip32_pubkey(ld->wallet->bip32_base, &final_key,
+			  channel->final_key_idx)) {
+		log_broken(channel->log, "Could not derive onchain key %"PRIu64,
+			   channel->final_key_idx);
+		return KEEP_WATCHING;
 	}
-	scriptpubkey = p2wpkh_for_keyidx(tmpctx, ld, keyindex);
-	if (!scriptpubkey) {
-		channel_internal_error(channel,
-				    "Can't get shutdown script %"PRIu64,
-				    keyindex);
-		tal_free(tmpctx);
-		return DELETE_WATCH;
-	}
-	txfilter_add_scriptpubkey(ld->owned_txfilter, scriptpubkey);
-
-	if (!bip32_pubkey(ld->wallet->bip32_base, &ourkey, keyindex)) {
-		channel_internal_error(channel,
-				    "Can't get shutdown key %"PRIu64,
-				    keyindex);
-		tal_free(tmpctx);
-		return DELETE_WATCH;
-	}
-
 	/* This could be a mutual close, but it doesn't matter. */
 	bitcoin_txid(channel->last_tx, &our_last_txid);
 
@@ -437,9 +403,10 @@ enum watch_result funding_spent(struct channel *channel,
 				  channel->our_config.dust_limit_satoshis,
 				  &channel->channel_info.theirbase.revocation,
 				  &our_last_txid,
-				  scriptpubkey,
+				  p2wpkh_for_keyidx(tmpctx, ld,
+						    channel->final_key_idx),
 				  channel->remote_shutdown_scriptpubkey,
-				  &ourkey,
+				  &final_key,
 				  channel->funder,
 				  &channel->channel_info.theirbase.payment,
 				  &channel->channel_info.theirbase.htlc,
@@ -463,8 +430,6 @@ enum watch_result funding_spent(struct channel *channel,
 
 	watch_tx_and_outputs(channel, tx);
 
-	tal_free(tmpctx);
 	/* We keep watching until peer finally deleted, for reorgs. */
 	return KEEP_WATCHING;
 }
-

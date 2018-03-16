@@ -285,7 +285,6 @@ static struct io_plan *sd_msg_reply(struct io_conn *conn, struct subd *sd,
 {
 	int type = fromwire_peektype(sd->msg_in);
 	bool freed = false;
-	const tal_t *tmpctx = tal_tmpctx(conn);
 	int *fds_in;
 
 	log_debug(sd->log, "REPLY %s with %zu fds",
@@ -309,7 +308,6 @@ static struct io_plan *sd_msg_reply(struct io_conn *conn, struct subd *sd,
 	/* Find out if they freed it. */
 	tal_add_destructor2(sd, mark_freed, &freed);
 	sr->replycb(sd, sd->msg_in, fds_in, sr->replycb_data);
-	tal_free(tmpctx);
 
 	if (freed)
 		return io_close(conn);
@@ -413,10 +411,21 @@ static bool handle_peer_error(struct subd *sd, const u8 *msg, int fds[2])
 	return true;
 }
 
+static bool handle_set_billboard(struct subd *sd, const u8 *msg)
+{
+	bool perm;
+	char *happenings;
+
+	if (!fromwire_status_peer_billboard(msg, msg, &perm, &happenings))
+		return false;
+
+	sd->billboardcb(sd->channel, perm, happenings);
+	return true;
+}
+
 static struct io_plan *sd_msg_read(struct io_conn *conn, struct subd *sd)
 {
 	int type = fromwire_peektype(sd->msg_in);
-	const tal_t *tmpctx;
 	struct subd_req *sr;
 	struct db *db = sd->ld->wallet->db;
 	struct io_plan *plan;
@@ -440,8 +449,7 @@ static struct io_plan *sd_msg_read(struct io_conn *conn, struct subd *sd)
 		goto out;
 	}
 
-	/* If not stolen, we'll free this below. */
-	tmpctx = tal_tmpctx(sd);
+	/* If not stolen, we'll free this later. */
 	tal_steal(tmpctx, sd->msg_in);
 
 	/* We handle status messages ourselves. */
@@ -460,6 +468,12 @@ static struct io_plan *sd_msg_read(struct io_conn *conn, struct subd *sd)
 			goto malformed;
 		log_info(sd->log, "Peer connection lost");
 		goto close;
+	case WIRE_STATUS_PEER_BILLBOARD:
+		if (!sd->channel)
+			goto malformed;
+		if (!handle_set_billboard(sd, sd->msg_in))
+			goto malformed;
+		goto next;
 	}
 
 	if (sd->channel) {
@@ -469,7 +483,6 @@ static struct io_plan *sd_msg_read(struct io_conn *conn, struct subd *sd)
 			if (!sd->fds_in) {
 				/* Don't free msg_in: we go around again. */
 				tal_steal(sd, sd->msg_in);
-				tal_free(tmpctx);
 				plan = sd_collect_fds(conn, sd, 2);
 				goto out;
 			}
@@ -500,7 +513,6 @@ static struct io_plan *sd_msg_read(struct io_conn *conn, struct subd *sd)
 			assert(!sd->fds_in);
 			/* Don't free msg_in: we go around again. */
 			tal_steal(sd, sd->msg_in);
-			tal_free(tmpctx);
 			plan = sd_collect_fds(conn, sd, i);
 			goto out;
 		}
@@ -509,7 +521,6 @@ static struct io_plan *sd_msg_read(struct io_conn *conn, struct subd *sd)
 next:
 	sd->msg_in = NULL;
 	sd->fds_in = tal_free(sd->fds_in);
-	tal_free(tmpctx);
 
 	plan = io_read_wire(conn, sd, &sd->msg_in, sd_msg_read, sd);
 	goto out;
@@ -567,6 +578,8 @@ static void destroy_subd(struct subd *sd)
 		struct db *db = sd->ld->wallet->db;
 		bool outer_transaction;
 
+		/* Clear any transient messages in billboard */
+		sd->billboardcb(channel, false, NULL);
 		sd->channel = NULL;
 
 		/* We can be freed both inside msg handling, or spontaneously. */
@@ -629,12 +642,17 @@ static struct subd *new_subd(struct lightningd *ld,
 					   const struct channel_id *channel_id,
 					   const char *desc,
 					   const u8 *err_for_them),
+			     void (*billboardcb)(void *channel,
+						 bool perm,
+						 const char *happenings),
 			     va_list *ap)
 {
 	struct subd *sd = tal(ld, struct subd);
 	int msg_fd;
 	const char *debug_subd = NULL;
 	int disconnect_fd = -1;
+
+	assert(name != NULL);
 
 #if DEVELOPER
 	debug_subd = ld->dev_debug_subdaemon;
@@ -661,6 +679,7 @@ static struct subd *new_subd(struct lightningd *ld,
 	sd->msgname = msgname;
 	sd->msgcb = msgcb;
 	sd->errcb = errcb;
+	sd->billboardcb = billboardcb;
 	sd->fds_in = NULL;
 	msg_queue_init(&sd->outq, sd);
 	tal_add_destructor(sd, destroy_subd);
@@ -673,6 +692,9 @@ static struct subd *new_subd(struct lightningd *ld,
 
 	log_debug(sd->log, "pid %u, msgfd %i", sd->pid, msg_fd);
 
+	/* Clear any old transient message. */
+	if (billboardcb)
+		billboardcb(sd->channel, false, NULL);
 	return sd;
 }
 
@@ -687,7 +709,7 @@ struct subd *new_global_subd(struct lightningd *ld,
 	struct subd *sd;
 
 	va_start(ap, msgcb);
-	sd = new_subd(ld, name, NULL, NULL, msgname, msgcb, NULL, &ap);
+	sd = new_subd(ld, name, NULL, NULL, msgname, msgcb, NULL, NULL, &ap);
 	va_end(ap);
 
 	sd->must_not_exit = true;
@@ -708,13 +730,16 @@ struct subd *new_channel_subd_(struct lightningd *ld,
 					     const struct channel_id *channel_id,
 					     const char *desc,
 					     const u8 *err_for_them),
+			       void (*billboardcb)(void *channel, bool perm,
+						   const char *happenings),
 			       ...)
 {
 	va_list ap;
 	struct subd *sd;
 
-	va_start(ap, errcb);
-	sd = new_subd(ld, name, channel, base_log, msgname, msgcb, errcb, &ap);
+	va_start(ap, billboardcb);
+	sd = new_subd(ld, name, channel, base_log, msgname,
+		      msgcb, errcb, billboardcb, &ap);
 	va_end(ap);
 	return sd;
 }

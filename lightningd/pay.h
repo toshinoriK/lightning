@@ -10,6 +10,7 @@ struct htlc_out;
 struct lightningd;
 struct route_hop;
 struct sha256;
+struct wallet_payment;
 
 /* Routing failure object */
 struct routing_failure {
@@ -29,6 +30,9 @@ struct sendpay_result {
 	/* Error code, one of the PAY_* macro in jsonrpc_errors.h.
 	 * Only loaded if payment failed. */
 	int errorcode;
+	/* Pointer to the payment. Only loaded if payment
+	 * succeeded or if error is PAY_IN_PROGRESS */
+	const struct wallet_payment *payment;
 	/* Unparseable onion reply. Only loaded if payment failed,
 	 * and errorcode == PAY_UNPARSEABLE_ONION. */
 	const u8* onionreply;
@@ -40,11 +44,37 @@ struct sendpay_result {
 	const char *details;
 };
 
+/* Initiate a payment.  Return true if the callback will be
+ * scheduled for later, or false if the callback has already
+ * been called. If the given context is freed before the
+ * callback is called, then the callback will no longer be
+ * called.
+ *
+ * This will call the callback "soon" in 10ms or less.
+ *
+ * Typically the callback will be called with a failed
+ * sendpay_result indicating an error code of PAY_IN_PROGRESS.
+ * It will only call the callback with successful sendpay_result
+ * if the payment has already completed with the same amount
+ * and destination before. */
 bool send_payment(const tal_t *ctx,
 		  struct lightningd* ld,
 		  const struct sha256 *rhash,
 		  const struct route_hop *route,
-		  void (*cb)(const struct sendpay_result*, void*),
+		  void (*cb)(const struct sendpay_result *, void*),
+		  void *cbarg);
+/* Wait for a previous send_payment to complete in definite
+ * success or failure. If the given context is freed before
+ * the callback is called, then the callback will no longer
+ * be called.
+ *
+ * Return true if the payment is still pending on return, or
+ * false if the callback was already invoked before this
+ * function returned. */
+bool wait_payment(const tal_t *ctx,
+		  struct lightningd* ld,
+		  const struct sha256 *payment_hash,
+		  void (*cb)(const struct sendpay_result *, void *cbarg),
 		  void *cbarg);
 
 void payment_succeeded(struct lightningd *ld, struct htlc_out *hout,
@@ -52,5 +82,8 @@ void payment_succeeded(struct lightningd *ld, struct htlc_out *hout,
 
 void payment_failed(struct lightningd *ld, const struct htlc_out *hout,
 		    const char *localfail);
+
+/* Inform payment system to save the payment. */
+void payment_store(struct lightningd *ld, const struct sha256 *payment_hash);
 
 #endif /* LIGHTNING_LIGHTNINGD_PAY_H */

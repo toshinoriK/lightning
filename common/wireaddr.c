@@ -4,8 +4,10 @@
 #include <common/type_to_string.h>
 #include <common/utils.h>
 #include <common/wireaddr.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <wire/wire.h>
 
 /* Returns false if we didn't parse it, and *cursor == NULL if malformed. */
@@ -75,7 +77,7 @@ REGISTER_TYPE_TO_STRING(wireaddr, fmt_wireaddr);
  * Returns false if it wasn't one of these forms.  If it returns true,
  * it only overwrites *port if it was specified by <number> above.
  */
-static bool separate_address_and_port(tal_t *ctx, const char *arg,
+static bool separate_address_and_port(const tal_t *ctx, const char *arg,
 				      char **addr, u16 *port)
 {
 	char *portcolon;
@@ -111,24 +113,28 @@ static bool separate_address_and_port(tal_t *ctx, const char *arg,
 	return true;
 }
 
-bool parse_wireaddr(const char *arg, struct wireaddr *addr, u16 defport)
+bool parse_wireaddr(const char *arg, struct wireaddr *addr, u16 defport,
+		    const char **err_msg)
 {
 	struct in6_addr v6;
 	struct in_addr v4;
+	struct sockaddr_in6 *sa6;
+	struct sockaddr_in *sa4;
+	struct addrinfo *addrinfo;
+	struct addrinfo hints;
+	int gai_err;
 	u16 port;
 	char *ip;
 	bool res;
-	tal_t *tmpctx = tal_tmpctx(NULL);
 
 	res = false;
 	port = defport;
+	if (err_msg)
+		*err_msg = NULL;
 
-	if (!separate_address_and_port(tmpctx, arg, &ip, &port)) {
-		tal_free(tmpctx);
-		return false;
-	}
+	if (!separate_address_and_port(tmpctx, arg, &ip, &port))
+		goto finish;
 
-	/* FIXME: change arg to addr[:port] and use getaddrinfo? */
 	if (streq(ip, "localhost"))
 		ip = "127.0.0.1";
 	else if (streq(ip, "ip6-localhost"))
@@ -150,6 +156,43 @@ bool parse_wireaddr(const char *arg, struct wireaddr *addr, u16 defport)
 		res = true;
 	}
 
-	tal_free(tmpctx);
+	/* Resolve with getaddrinfo */
+	if (!res) {
+		memset(&hints, 0, sizeof(hints));
+		hints.ai_family = AF_UNSPEC;
+		hints.ai_socktype = SOCK_STREAM;
+		hints.ai_protocol = 0;
+		hints.ai_flags = AI_ADDRCONFIG;
+		gai_err = getaddrinfo(ip, tal_fmt(tmpctx, "%d", port),
+				      &hints, &addrinfo);
+		if (gai_err != 0) {
+			if (err_msg)
+				*err_msg = gai_strerror(gai_err);
+			goto finish;
+		}
+		/* Use only the first found address */
+		if (addrinfo->ai_family == AF_INET) {
+			addr->type = ADDR_TYPE_IPV4;
+			addr->addrlen = 4;
+			addr->port = port;
+			sa4 = (struct sockaddr_in *) addrinfo->ai_addr;
+			memcpy(&addr->addr, &sa4->sin_addr, addr->addrlen);
+			res = true;
+		} else if (addrinfo->ai_family == AF_INET6) {
+			addr->type = ADDR_TYPE_IPV6;
+			addr->addrlen = 16;
+			addr->port = port;
+			sa6 = (struct sockaddr_in6 *) addrinfo->ai_addr;
+			memcpy(&addr->addr, &sa6->sin6_addr, addr->addrlen);
+			res = true;
+		}
+
+		/* Clean up */
+		freeaddrinfo(addrinfo);
+	}
+
+finish:
+	if (!res && err_msg && !*err_msg)
+		*err_msg = "Error parsing hostname";
 	return res;
 }

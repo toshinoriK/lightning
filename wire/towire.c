@@ -3,6 +3,7 @@
 #include <bitcoin/shadouble.h>
 #include <bitcoin/tx.h>
 #include <ccan/crypto/ripemd160/ripemd160.h>
+#include <ccan/crypto/siphash24/siphash24.h>
 #include <ccan/endian/endian.h>
 #include <ccan/mem/mem.h>
 #include <ccan/tal/tal.h>
@@ -37,6 +38,11 @@ void towire_u64(u8 **pptr, u64 v)
 {
 	be64 l = cpu_to_be64(v);
 	towire(pptr, &l, sizeof(l));
+}
+
+void towire_double(u8 **pptr, const double *v)
+{
+	towire(pptr, v, sizeof(*v));
 }
 
 void towire_bool(u8 **pptr, bool v)
@@ -99,12 +105,7 @@ void towire_channel_id(u8 **pptr, const struct channel_id *channel_id)
 void towire_short_channel_id(u8 **pptr,
 			     const struct short_channel_id *short_channel_id)
 {
-	be32 txnum = cpu_to_be32(short_channel_id->txnum);
-	be32 blocknum = cpu_to_be32(short_channel_id->blocknum);
-
-	towire(pptr, (char *)&blocknum + 1, 3);
-	towire(pptr, (char *)&txnum + 1, 3);
-	towire_u16(pptr, short_channel_id->outnum);
+	towire_u64(pptr, short_channel_id->u64);
 }
 
 void towire_sha256(u8 **pptr, const struct sha256 *sha256)
@@ -158,8 +159,11 @@ void towire_wirestring(u8 **pptr, const char *str)
 
 void towire_bitcoin_tx(u8 **pptr, const struct bitcoin_tx *tx)
 {
-	tal_t *tmpctx = tal_tmpctx(NULL);
 	u8 *lin = linearize_tx(tmpctx, tx);
 	towire_u8_array(pptr, lin, tal_len(lin));
-	tal_free(tmpctx);
+}
+
+void towire_siphash_seed(u8 **pptr, const struct siphash_seed *seed)
+{
+	towire(pptr, seed, sizeof(*seed));
 }

@@ -36,6 +36,9 @@ struct uncommitted_channel {
 	/* For logging */
 	struct log *log;
 
+	/* Openingd can tell us stuff. */
+	const char *transient_billboard;
+
 	/* If we offered channel, this contains information, otherwise NULL */
 	struct funding_channel *fc;
 
@@ -127,6 +130,11 @@ void json_add_uncommitted_channel(struct json_result *response,
 	json_add_string(response, "owner", "lightning_openingd");
 	json_add_string(response, "funder",
 			uc->fc ? "LOCAL" : "REMOTE");
+	if (uc->transient_billboard) {
+		json_array_start(response, "status");
+		json_add_string(response, NULL, uc->transient_billboard);
+		json_array_end(response);
+	}
 	if (uc->fc) {
 		u64 msatoshi_total, our_msatoshi;
 
@@ -138,7 +146,8 @@ void json_add_uncommitted_channel(struct json_result *response,
 	json_object_end(response);
 }
 
-/* Steals fields from uncommitted_channel */
+/* Steals fields from uncommitted_channel: returns NULL if can't generate a
+ * key for this channel (shouldn't happen!). */
 static struct channel *
 wallet_commit_channel(struct lightningd *ld,
 		      struct uncommitted_channel *uc,
@@ -154,6 +163,14 @@ wallet_commit_channel(struct lightningd *ld,
 {
 	struct channel *channel;
 	u64 our_msatoshi;
+	s64 final_key_idx;
+
+	/* Get a key to use for closing outputs from this tx */
+	final_key_idx = wallet_get_newindex(ld);
+	if (final_key_idx == -1) {
+		log_broken(uc->log, "Can't get final key index");
+		return NULL;
+	}
 
 	if (uc->fc)
 		our_msatoshi = funding_satoshi * 1000 - push_msat;
@@ -173,6 +190,7 @@ wallet_commit_channel(struct lightningd *ld,
 			      CHANNELD_AWAITING_LOCKIN,
 			      uc->fc ? LOCAL : REMOTE,
 			      uc->log,
+			      take(uc->transient_billboard),
 			      channel_flags,
 			      &uc->our_config,
 			      uc->minimum_depth,
@@ -189,7 +207,7 @@ wallet_commit_channel(struct lightningd *ld,
 			      NULL, /* No HTLC sigs yet */
 			      channel_info,
 			      NULL, /* No remote_shutdown_scriptpubkey yet */
-			      -1, false,
+			      final_key_idx, false,
 			      NULL, /* No commit sent yet */
 			      uc->first_blocknum);
 
@@ -211,7 +229,6 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 				    const int *fds,
 				    struct funding_channel *fc)
 {
-	tal_t *tmpctx = tal_tmpctx(fc);
 	u8 *msg, *linear;
 	struct channel_info channel_info;
 	struct bitcoin_tx *fundingtx;
@@ -257,7 +274,7 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 		goto failed;
 	}
 	log_debug(ld->log,
-		  "%s", type_to_string(ltmp, struct pubkey,
+		  "%s", type_to_string(tmpctx, struct pubkey,
 				       &channel_info.remote_per_commit));
 
 	/* Generate the funding tx. */
@@ -283,7 +300,7 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 		log_debug(fc->uc->log, "%zi: %"PRIu64" satoshi (%s) %s\n",
 			  i, fc->utxomap[i]->amount,
 			  fc->utxomap[i]->is_p2sh ? "P2SH" : "SEGWIT",
-			  type_to_string(ltmp, struct bitcoin_txid,
+			  type_to_string(tmpctx, struct bitcoin_txid,
 					 &fundingtx->input[i].txid));
 	}
 
@@ -326,6 +343,10 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 					fc->channel_flags,
 					&channel_info,
 					feerate);
+	if (!channel) {
+		command_fail(fc->cmd, "Key generation failure");
+		goto failed;
+	}
 
 	/* Get HSM to sign the funding tx. */
 	log_debug(channel->log, "Getting HSM to sign funding tx");
@@ -345,7 +366,7 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 		      tal_hex(msg, resp));
 
 	/* Extract the change output and add it to the DB */
-	wallet_extract_owned_outputs(ld->wallet, fundingtx, &change_satoshi);
+	wallet_extract_owned_outputs(ld->wallet, fundingtx, NULL, &change_satoshi);
 
 	/* Send it out and watch for confirms. */
 	broadcast_tx(ld->topology, channel, fundingtx, funding_broadcast_failed);
@@ -390,7 +411,6 @@ static void opening_fundee_finished(struct subd *openingd,
 	u64 gossip_index;
 	secp256k1_ecdsa_signature remote_commit_sig;
 	struct bitcoin_tx *remote_commit;
-	const tal_t *tmpctx = tal_tmpctx(uc);
 	struct lightningd *ld = openingd->ld;
 	struct bitcoin_txid funding_txid;
 	u16 funding_outnum;
@@ -441,6 +461,10 @@ static void opening_fundee_finished(struct subd *openingd,
 					channel_flags,
 					&channel_info,
 					feerate);
+	if (!channel) {
+		tal_free(uc);
+		return;
+	}
 
 	log_debug(channel->log, "Watching funding tx %s",
 		     type_to_string(reply, struct bitcoin_txid,
@@ -460,7 +484,7 @@ static void opening_channel_errmsg(struct uncommitted_channel *uc,
 				   int peer_fd, int gossip_fd,
 				   const struct crypto_state *cs,
 				   u64 gossip_index,
-				   const struct channel_id *channel_id,
+				   const struct channel_id *channel_id UNUSED,
 				   const char *desc,
 				   const u8 *err_for_them)
 {
@@ -479,6 +503,16 @@ static void opening_channel_errmsg(struct uncommitted_channel *uc,
 					       "%s ERROR %s", errsrc, desc);
 	}
 	tal_free(uc);
+}
+
+/* There's nothing permanent in an unconfirmed transaction */
+static void opening_channel_set_billboard(struct uncommitted_channel *uc,
+					  bool perm UNUSED,
+					  const char *happenings TAKES)
+{
+	uc->transient_billboard = tal_free(uc->transient_billboard);
+	if (happenings)
+		uc->transient_billboard = tal_strdup(uc, happenings);
 }
 
 static void destroy_uncommitted_channel(struct uncommitted_channel *uc)
@@ -511,6 +545,7 @@ new_uncommitted_channel(struct lightningd *ld,
 	if (peer_active_channel(uc->peer))
 		return tal_free(uc);
 
+	uc->transient_billboard = NULL;
 	uc->dbid = wallet_get_channel_dbid(ld->wallet);
 
 	idname = type_to_string(uc, struct pubkey, &uc->peer->id);
@@ -581,7 +616,7 @@ u8 *peer_accept_channel(struct lightningd *ld,
 			const struct wireaddr *addr,
 			const struct crypto_state *cs,
 			u64 gossip_index,
-			const u8 *gfeatures, const u8 *lfeatures,
+			const u8 *gfeatures UNUSED, const u8 *lfeatures UNUSED,
 			int peer_fd, int gossip_fd,
 			const struct channel_id *channel_id,
 			const u8 *open_msg)
@@ -602,6 +637,7 @@ u8 *peer_accept_channel(struct lightningd *ld,
 	uc->openingd = new_channel_subd(ld, "lightning_openingd", uc, uc->log,
 					opening_wire_type_name,	NULL,
 					opening_channel_errmsg,
+					opening_channel_set_billboard,
 					take(&peer_fd), take(&gossip_fd),
 					NULL);
 	if (!uc->openingd) {
@@ -662,7 +698,7 @@ static void peer_offer_channel(struct lightningd *ld,
 			       const struct wireaddr *addr,
 			       const struct crypto_state *cs,
 			       u64 gossip_index,
-			       const u8 *gfeatures, const u8 *lfeatures,
+			       const u8 *gfeatures UNUSED, const u8 *lfeatures UNUSED,
 			       int peer_fd, int gossip_fd)
 {
 	u8 *msg;
@@ -687,6 +723,7 @@ static void peer_offer_channel(struct lightningd *ld,
 				    "lightning_openingd", fc->uc, fc->uc->log,
 				    opening_wire_type_name, NULL,
 				    opening_channel_errmsg,
+				    opening_channel_set_billboard,
 				    take(&peer_fd), take(&gossip_fd),
 				    NULL);
 	if (!fc->uc->openingd) {
@@ -750,7 +787,7 @@ static void gossip_peer_released(struct subd *gossip,
 			fatal("Gossip daemon gave invalid reply %s",
 			      tal_hex(gossip, resp));
 		}
- 		if (uc)
+		if (uc)
 			command_fail(fc->cmd, "Peer already OPENING");
 		else if (c)
 			command_fail(fc->cmd, "Peer already %s",

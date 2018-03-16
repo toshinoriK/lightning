@@ -1,14 +1,13 @@
 #ifndef WALLET_DB_H
 #define WALLET_DB_H
-
 #include "config.h"
-#include <bitcoin/pubkey.h>
+
 #include <bitcoin/preimage.h>
+#include <bitcoin/pubkey.h>
 #include <bitcoin/short_channel_id.h>
 #include <bitcoin/tx.h>
 #include <ccan/short_types/short_types.h>
 #include <ccan/tal/tal.h>
-
 #include <secp256k1_ecdh.h>
 #include <sqlite3.h>
 #include <stdbool.h>
@@ -112,6 +111,10 @@ void db_exec_prepared_(const char *caller, struct db *db, sqlite3_stmt *stmt);
 bool db_exec_prepared_mayfail_(const char *caller,
 			       struct db *db,
 			       sqlite3_stmt *stmt);
+
+/* Do not keep db open across a fork: needed for --daemon */
+void db_close_for_fork(struct db *db);
+void db_reopen_after_fork(struct db *db);
 
 #define sqlite3_column_arr(ctx, stmt, col, type)			\
 	((type *)sqlite3_column_arr_((ctx), (stmt), (col),		\

@@ -5,6 +5,7 @@
 #include "peer_control.h"
 #include "subd.h"
 #include <ccan/array_size/array_size.h>
+#include <ccan/crypto/siphash24/siphash24.h>
 #include <ccan/err/err.h>
 #include <ccan/fdpass/fdpass.h>
 #include <ccan/take/take.h>
@@ -22,6 +23,8 @@
 #include <lightningd/hsm_control.h>
 #include <lightningd/jsonrpc.h>
 #include <lightningd/log.h>
+#include <sodium/randombytes.h>
+#include <string.h>
 #include <wire/gen_peer_wire.h>
 #include <wire/wire_sync.h>
 
@@ -43,7 +46,7 @@ static void peer_nongossip(struct subd *gossip, const u8 *msg,
 		      tal_hex(msg, msg));
 
 	/* We already checked the features when it first connected. */
-	if (unsupported_features(gfeatures, lfeatures)) {
+	if (!features_supported(gfeatures, lfeatures)) {
 		log_unusual(gossip->log,
 			    "Gossip gave unsupported features %s/%s",
 			    tal_hex(msg, gfeatures),
@@ -63,21 +66,27 @@ static void got_txout(struct bitcoind *bitcoind,
 		      struct short_channel_id *scid)
 {
 	const u8 *script;
+	u64 satoshis;
 
 	/* output will be NULL if it wasn't found */
-	if (output)
+	if (output) {
 		script = output->script;
-	else
+		satoshis = output->amount;
+	} else {
 		script = NULL;
+		satoshis = 0;
+	}
 
-	subd_send_msg(bitcoind->ld->gossip,
-		      towire_gossip_get_txout_reply(scid, scid, script));
+	subd_send_msg(
+	    bitcoind->ld->gossip,
+	    towire_gossip_get_txout_reply(scid, scid, satoshis, script));
 	tal_free(scid);
 }
 
 static void get_txout(struct subd *gossip, const u8 *msg)
 {
 	struct short_channel_id *scid = tal(gossip, struct short_channel_id);
+	struct outpoint *op;
 
 	if (!fromwire_gossip_get_txout(msg, scid))
 		fatal("Gossip gave bad GOSSIP_GET_TXOUT message %s",
@@ -85,9 +94,20 @@ static void get_txout(struct subd *gossip, const u8 *msg)
 
 	/* FIXME: Block less than 6 deep? */
 
-	bitcoind_getoutput(gossip->ld->topology->bitcoind,
-			   scid->blocknum, scid->txnum, scid->outnum,
-			   got_txout, scid);
+	op = wallet_outpoint_for_scid(gossip->ld->wallet, scid, scid);
+
+	if (op) {
+		subd_send_msg(gossip,
+			      towire_gossip_get_txout_reply(
+				  scid, scid, op->satoshis, op->scriptpubkey));
+		tal_free(scid);
+	} else {
+		bitcoind_getoutput(gossip->ld->topology->bitcoind,
+				   short_channel_id_blocknum(scid),
+				   short_channel_id_txnum(scid),
+				   short_channel_id_outnum(scid),
+				   got_txout, scid);
+	}
 }
 
 static unsigned gossip_msg(struct subd *gossip, const u8 *msg, const int *fds)
@@ -113,6 +133,7 @@ static unsigned gossip_msg(struct subd *gossip, const u8 *msg, const int *fds)
 	case WIRE_GOSSIP_DISABLE_CHANNEL:
 	case WIRE_GOSSIP_ROUTING_FAILURE:
 	case WIRE_GOSSIP_MARK_CHANNEL_UNROUTABLE:
+	case WIRE_GOSSIPCTL_PEER_DISCONNECT:
 	/* This is a reply, so never gets through to here. */
 	case WIRE_GOSSIP_GET_UPDATE_REPLY:
 	case WIRE_GOSSIP_GETNODES_REPLY:
@@ -123,6 +144,8 @@ static unsigned gossip_msg(struct subd *gossip, const u8 *msg, const int *fds)
 	case WIRE_GOSSIP_RESOLVE_CHANNEL_REPLY:
 	case WIRE_GOSSIPCTL_RELEASE_PEER_REPLY:
 	case WIRE_GOSSIPCTL_RELEASE_PEER_REPLYFAIL:
+	case WIRE_GOSSIPCTL_PEER_DISCONNECT_REPLY:
+	case WIRE_GOSSIPCTL_PEER_DISCONNECT_REPLYFAIL:
 		break;
 	/* These are inter-daemon messages, not received by us */
 	case WIRE_GOSSIP_LOCAL_ADD_CHANNEL:
@@ -155,7 +178,6 @@ static unsigned gossip_msg(struct subd *gossip, const u8 *msg, const int *fds)
  * message */
 void gossip_init(struct lightningd *ld)
 {
-	tal_t *tmpctx = tal_tmpctx(ld);
 	u8 *msg;
 	int hsmfd;
 	u64 capabilities = HSM_CAP_ECDH | HSM_CAP_SIGN_GOSSIP;
@@ -181,11 +203,10 @@ void gossip_init(struct lightningd *ld)
 	msg = towire_gossipctl_init(
 	    tmpctx, ld->config.broadcast_interval,
 	    &get_chainparams(ld)->genesis_blockhash, &ld->id, ld->portnum,
-	    get_supported_global_features(tmpctx),
-	    get_supported_local_features(tmpctx), ld->wireaddrs, ld->rgb,
+	    get_offered_global_features(tmpctx),
+	    get_offered_local_features(tmpctx), ld->wireaddrs, ld->rgb,
 	    ld->alias, ld->config.channel_update_interval);
 	subd_send_msg(ld->gossip, msg);
-	tal_free(tmpctx);
 }
 
 static void json_getnodes_reply(struct subd *gossip UNUSED, const u8 *reply,
@@ -259,7 +280,7 @@ static void json_listnodes(struct command *cmd, const char *buffer,
 static const struct json_command listnodes_command = {
 	"listnodes",
 	json_listnodes,
-	"Show all nodes in our local network view"
+	"Show node {id} (or all, if no {id}), in our local network view"
 };
 AUTODATA(json_command, &listnodes_command);
 
@@ -299,9 +320,18 @@ static void json_getroute(struct command *cmd, const char *buffer, const jsmntok
 	struct lightningd *ld = cmd->ld;
 	struct pubkey source = ld->id, destination;
 	jsmntok_t *idtok, *msatoshitok, *riskfactortok, *cltvtok, *fromidtok;
+	jsmntok_t *fuzztok;
+	jsmntok_t *seedtok;
 	u64 msatoshi;
 	unsigned cltv = 9;
 	double riskfactor;
+	/* Higher fuzz means that some high-fee paths can be discounted
+	 * for an even larger value, increasing the scope for route
+	 * randomization (the higher-fee paths become more likely to
+	 * be selected) at the cost of increasing the probability of
+	 * selecting the higher-fee paths. */
+	double fuzz = 75.0;
+	struct siphash_seed seed;
 
 	if (!json_get_params(cmd, buffer, params,
 			     "id", &idtok,
@@ -309,6 +339,8 @@ static void json_getroute(struct command *cmd, const char *buffer, const jsmntok
 			     "riskfactor", &riskfactortok,
 			     "?cltv", &cltvtok,
 			     "?fromid", &fromidtok,
+			     "?fuzzpercent", &fuzztok,
+			     "?seed", &seedtok,
 			     NULL)) {
 		return;
 	}
@@ -342,7 +374,34 @@ static void json_getroute(struct command *cmd, const char *buffer, const jsmntok
 		return;
 	}
 
-	u8 *req = towire_gossip_getroute_request(cmd, &source, &destination, msatoshi, riskfactor*1000, cltv);
+	if (fuzztok &&
+	    !json_tok_double(buffer, fuzztok, &fuzz)) {
+		command_fail(cmd, "'%.*s' is not a valid double",
+			     fuzztok->end - fuzztok->start,
+			     buffer + fuzztok->start);
+		return;
+	}
+	if (!(0.0 <= fuzz && fuzz <= 100.0)) {
+		command_fail(cmd,
+			     "fuzz must be in range 0.0 <= %f <= 100.0",
+			     fuzz);
+		return;
+	}
+	/* Convert from percentage */
+	fuzz = fuzz / 100.0;
+
+	if (seedtok) {
+		if (seedtok->end - seedtok->start > sizeof(seed))
+			command_fail(cmd,
+				     "seed must be < %zu bytes", sizeof(seed));
+
+		memset(&seed, 0, sizeof(seed));
+		memcpy(&seed, buffer + seedtok->start,
+		       seedtok->end - seedtok->start);
+	} else
+		randombytes_buf(&seed, sizeof(seed));
+
+	u8 *req = towire_gossip_getroute_request(cmd, &source, &destination, msatoshi, riskfactor*1000, cltv, &fuzz, &seed);
 	subd_req(ld->gossip, ld->gossip, req, -1, 0, json_getroute_reply, cmd);
 	command_still_pending(cmd);
 }
@@ -350,7 +409,10 @@ static void json_getroute(struct command *cmd, const char *buffer, const jsmntok
 static const struct json_command getroute_command = {
 	"getroute",
 	json_getroute,
-	"Show route to {id} for {msatoshi}, using {riskfactor} and optional {cltv} (default 9), if specified search from {source} otherwise use this node as source."
+	"Show route to {id} for {msatoshi}, using {riskfactor} and optional {cltv} (default 9). "
+	"If specified search from {fromid} otherwise use this node as source. "
+	"Randomize the route with up to {fuzzpercent} (0.0 -> 100.0, default 5.0) "
+	"using {seed} as an arbitrary-size string seed."
 };
 AUTODATA(json_command, &getroute_command);
 
@@ -380,6 +442,7 @@ static void json_listchannels_reply(struct subd *gossip UNUSED, const u8 *reply,
 		json_add_num(response, "flags", entries[i].flags);
 		json_add_bool(response, "active", entries[i].active);
 		json_add_bool(response, "public", entries[i].public);
+		json_add_u64(response, "satoshis", entries[i].satoshis);
 		if (entries[i].last_update_timestamp >= 0) {
 			json_add_num(response, "last_update",
 				     entries[i].last_update_timestamp);
@@ -426,6 +489,6 @@ static void json_listchannels(struct command *cmd, const char *buffer,
 static const struct json_command listchannels_command = {
 	"listchannels",
 	json_listchannels,
-	"Show all known channels"
+	"Show channel {short_channel_id} (or all known channels, if no {short_channel_id})"
 };
 AUTODATA(json_command, &listchannels_command);

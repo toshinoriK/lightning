@@ -18,6 +18,8 @@ static int backtrace_status(void *unused UNUSED, uintptr_t pc,
 			    const char *filename, int lineno,
 			    const char *function)
 {
+	fprintf(stderr, "backtrace: %s:%u (%s) %p\n",
+		filename, lineno, function, (void *)pc);
 	status_trace("backtrace: %s:%u (%s) %p",
 		     filename, lineno, function, (void *)pc);
 	return 0;
@@ -70,6 +72,8 @@ void subdaemon_setup(int argc, char *argv[])
 	signal(SIGPIPE, SIG_IGN);
 	secp256k1_ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY
 						 | SECP256K1_CONTEXT_SIGN);
+
+	setup_tmpctx();
 
 	for (int i = 1; i < argc; i++) {
 		if (streq(argv[i], "--log-io"))

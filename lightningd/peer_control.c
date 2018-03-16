@@ -4,6 +4,7 @@
 #include <arpa/inet.h>
 #include <bitcoin/script.h>
 #include <bitcoin/tx.h>
+#include <ccan/array_size/array_size.h>
 #include <ccan/io/io.h>
 #include <ccan/noerr/noerr.h>
 #include <ccan/str/str.h>
@@ -168,7 +169,6 @@ u32 feerate_max(struct lightningd *ld)
 
 static void sign_last_tx(struct channel *channel)
 {
-	const tal_t *tmpctx = tal_tmpctx(channel);
 	u8 *funding_wscript;
 	struct pubkey local_funding_pubkey;
 	struct secrets secrets;
@@ -196,8 +196,6 @@ static void sign_last_tx(struct channel *channel)
 				       &sig,
 				       &channel->channel_info.remote_fundingkey,
 				       &local_funding_pubkey);
-
-	tal_free(tmpctx);
 }
 
 static void remove_sig(struct bitcoin_tx *signed_tx)
@@ -281,8 +279,8 @@ void peer_connected(struct lightningd *ld, const u8 *msg,
 	struct crypto_state cs;
 	u8 *gfeatures, *lfeatures;
 	u8 *error;
-	u8 *supported_global_features;
-	u8 *supported_local_features;
+	u8 *global_features;
+	u8 *local_features;
 	struct channel *channel;
 	struct wireaddr addr;
 	u64 gossip_index;
@@ -294,22 +292,22 @@ void peer_connected(struct lightningd *ld, const u8 *msg,
 		fatal("Gossip gave bad GOSSIP_PEER_CONNECTED message %s",
 		      tal_hex(msg, msg));
 
-	if (unsupported_features(gfeatures, lfeatures)) {
+	if (!features_supported(gfeatures, lfeatures)) {
 		log_unusual(ld->log, "peer %s offers unsupported features %s/%s",
 			    type_to_string(msg, struct pubkey, &id),
 			    tal_hex(msg, gfeatures),
 			    tal_hex(msg, lfeatures));
-		supported_global_features = get_supported_global_features(msg);
-		supported_local_features = get_supported_local_features(msg);
+		global_features = get_offered_global_features(msg);
+		local_features = get_offered_local_features(msg);
 		error = towire_errorfmt(msg, NULL,
-					"We only support globalfeatures %s"
+					"We only offer globalfeatures %s"
 					" and localfeatures %s",
 					tal_hexstr(msg,
-						   supported_global_features,
-						   tal_len(supported_global_features)),
+						   global_features,
+						   tal_len(global_features)),
 					tal_hexstr(msg,
-						   supported_local_features,
-						   tal_len(supported_local_features)));
+						   local_features,
+						   tal_len(local_features)));
 		goto send_error;
 	}
 
@@ -343,11 +341,8 @@ void peer_connected(struct lightningd *ld, const u8 *msg,
 #endif
 
 		switch (channel->state) {
-		case ONCHAIND_CHEATED:
-		case ONCHAIND_THEIR_UNILATERAL:
-		case ONCHAIND_OUR_UNILATERAL:
+		case ONCHAIN:
 		case FUNDING_SPEND_SEEN:
-		case ONCHAIND_MUTUAL:
 		case CLOSINGD_COMPLETE:
 			/* Channel is active! */
 			abort();
@@ -523,9 +518,9 @@ static enum watch_result funding_lockin_cb(struct channel *channel,
 	/* If we restart, we could already have peer->scid from database */
 	if (!channel->scid) {
 		channel->scid = tal(channel, struct short_channel_id);
-		channel->scid->blocknum = loc->blkheight;
-		channel->scid->txnum = loc->index;
-		channel->scid->outnum = channel->funding_outnum;
+		mk_short_channel_id(channel->scid,
+				    loc->blkheight, loc->index,
+				    channel->funding_outnum);
 	}
 	tal_free(loc);
 
@@ -590,10 +585,11 @@ static void gossipd_getpeers_complete(struct subd *gossip, const u8 *msg,
 	/* This is a little sneaky... */
 	struct pubkey *ids;
 	struct wireaddr *addrs;
+	struct gossip_getnodes_entry **nodes;
 	struct json_result *response = new_json_result(gpa->cmd);
 	struct peer *p;
 
-	if (!fromwire_gossip_getpeers_reply(msg, msg, &ids, &addrs)) {
+	if (!fromwire_gossip_getpeers_reply(msg, msg, &ids, &addrs, &nodes)) {
 		command_fail(gpa->cmd, "Bad response from gossipd");
 		return;
 	}
@@ -622,6 +618,17 @@ static void gossipd_getpeers_complete(struct subd *gossip, const u8 *msg,
 							       struct wireaddr,
 							       &p->addr));
 			json_array_end(response);
+		}
+
+		for (size_t i = 0; i < tal_count(nodes); i++) {
+			/* If no addresses, then this node announcement hasn't been recieved yet
+			 * So no alias information either.
+			 */
+			if (nodes[i]->addresses != NULL && pubkey_eq(&nodes[i]->nodeid, &p->id)) {
+				json_add_string_escape(response, "alias", (char*)nodes[i]->alias);
+				json_add_hex(response, "color", nodes[i]->color, ARRAY_SIZE(nodes[i]->color));
+				break;
+			}
 		}
 
 		json_array_start(response, "channels");
@@ -655,11 +662,33 @@ static void gossipd_getpeers_complete(struct subd *gossip, const u8 *msg,
 				     channel->our_config.channel_reserve_satoshis);
 			json_add_u64(response, "htlc_minimum_msat",
 				     channel->our_config.htlc_minimum_msat);
-			json_add_num(response, "to_self_delay",
+			/* The `to_self_delay` is imposed on the *other*
+			 * side, so our configuration `to_self_delay` is
+			 * imposed on their side, while their configuration
+			 * `to_self_delay` is imposed on ours. */
+			json_add_num(response, "their_to_self_delay",
 				     channel->our_config.to_self_delay);
+			json_add_num(response, "our_to_self_delay",
+				     channel->channel_info.their_config.to_self_delay);
+			if (deprecated_apis)
+				json_add_num(response, "to_self_delay",
+					     channel->our_config.to_self_delay);
 			json_add_num(response, "max_accepted_htlcs",
 				     channel->our_config.max_accepted_htlcs);
 
+			json_array_start(response, "status");
+			for (size_t i = 0;
+			     i < ARRAY_SIZE(channel->billboard.permanent);
+			     i++) {
+				if (!channel->billboard.permanent[i])
+					continue;
+				json_add_string(response, NULL,
+						channel->billboard.permanent[i]);
+			}
+			if (channel->billboard.transient)
+				json_add_string(response, NULL,
+						channel->billboard.transient);
+			json_array_end(response);
 			json_object_end(response);
 		}
 		json_array_end(response);
@@ -679,6 +708,13 @@ static void gossipd_getpeers_complete(struct subd *gossip, const u8 *msg,
 		/* Fake state. */
 		json_add_string(response, "state", "GOSSIPING");
 		json_add_pubkey(response, "id", ids+i);
+		for (size_t j = 0; j < tal_count(nodes); j++) {
+			if (nodes[j]->addresses != NULL && pubkey_eq(&nodes[j]->nodeid, ids+i)) {
+				json_add_string_escape(response, "alias", (char*)nodes[j]->alias);
+				json_add_hex(response, "color", nodes[j]->color, ARRAY_SIZE(nodes[j]->color));
+				break;
+			}
+		}
 		json_array_start(response, "netaddr");
 		if (addrs[i].type != ADDR_TYPE_PADDING)
 			json_add_string(response, NULL,
@@ -778,28 +814,12 @@ static void json_close(struct command *cmd,
 
 	/* Normal case. */
 	if (channel->state == CHANNELD_NORMAL) {
-		u8 *shutdown_scriptpubkey;
-
-		channel->local_shutdown_idx = wallet_get_newindex(cmd->ld);
-		if (channel->local_shutdown_idx == -1) {
-			command_fail(cmd, "Failed to get new key for shutdown");
-			return;
-		}
-		shutdown_scriptpubkey = p2wpkh_for_keyidx(cmd, cmd->ld,
-							  channel->local_shutdown_idx);
-		if (!shutdown_scriptpubkey) {
-			command_fail(cmd, "Failed to get script for shutdown");
-			return;
-		}
-
-		channel_set_state(channel, CHANNELD_NORMAL, CHANNELD_SHUTTING_DOWN);
-
-		txfilter_add_scriptpubkey(cmd->ld->owned_txfilter, shutdown_scriptpubkey);
+		channel_set_state(channel,
+				  CHANNELD_NORMAL, CHANNELD_SHUTTING_DOWN);
 
 		if (channel->owner)
 			subd_send_msg(channel->owner,
-				      take(towire_channel_send_shutdown(channel,
-						   shutdown_scriptpubkey)));
+				      take(towire_channel_send_shutdown(channel)));
 
 		command_success(cmd, null_response(cmd));
 	} else
@@ -844,6 +864,60 @@ void activate_peers(struct lightningd *ld)
 	list_for_each(&ld->peers, p, list)
 		activate_peer(p);
 }
+
+/* Peer has been released from gossip. */
+static void gossip_peer_disconnected (struct subd *gossip,
+				 const u8 *resp,
+				 const int *fds,
+				 struct command *cmd) {
+	bool isconnected;
+
+	if (!fromwire_gossipctl_peer_disconnect_reply(resp)) {
+		if (!fromwire_gossipctl_peer_disconnect_replyfail(resp, &isconnected))
+			fatal("Gossip daemon gave invalid reply %s",
+			      tal_hex(gossip, resp));
+		if (isconnected)
+			command_fail(cmd, "Peer is not in gossip mode");
+		else
+			command_fail(cmd, "Peer not connected");
+	} else {
+		/* Successfully disconnected */
+		command_success(cmd, null_response(cmd));
+	}
+	return;
+}
+
+static void json_disconnect(struct command *cmd,
+			 const char *buffer, const jsmntok_t *params)
+{
+	jsmntok_t *idtok;
+	struct pubkey id;
+	u8 *msg;
+
+	if (!json_get_params(cmd, buffer, params,
+			     "id", &idtok,
+			     NULL)) {
+		return;
+	}
+
+	if (!json_tok_pubkey(buffer, idtok, &id)) {
+		command_fail(cmd, "id %.*s not valid",
+			     idtok->end - idtok->start,
+			     buffer + idtok->start);
+		return;
+	}
+
+	msg = towire_gossipctl_peer_disconnect(cmd, &id);
+	subd_req(cmd, cmd->ld->gossip, msg, -1, 0, gossip_peer_disconnected, cmd);
+	command_still_pending(cmd);
+}
+
+static const struct json_command disconnect_command = {
+	"disconnect",
+	json_disconnect,
+	"Disconnect from {id} that has previously been connected to using connect"
+};
+AUTODATA(json_command, &disconnect_command);
 
 #if DEVELOPER
 static void json_sign_last_tx(struct command *cmd,
@@ -1058,7 +1132,7 @@ static void json_dev_forget_channel(struct command *cmd, const char *buffer,
 		if (scidtok) {
 			if (!channel->scid)
 				continue;
-			if (!short_channel_id_eq(channel->scid, &scid))
+			if (!structeq(channel->scid, &scid))
 				continue;
 		}
 		if (forget->channel) {
@@ -1073,6 +1147,15 @@ static void json_dev_forget_channel(struct command *cmd, const char *buffer,
 		command_fail(cmd,
 			     "No channels matching that short_channel_id");
 		return;
+	}
+
+	if (channel_has_htlc_out(forget->channel) ||
+	    channel_has_htlc_in(forget->channel)) {
+		command_fail(cmd, "This channel has HTLCs attached and it is "
+				  "not safe to forget it. Please use `close` "
+				  "or `dev-fail` instead.");
+		return;
+
 	}
 
 	bitcoind_gettxout(cmd->ld->topology->bitcoind,

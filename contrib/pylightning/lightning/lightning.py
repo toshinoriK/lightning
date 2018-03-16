@@ -150,7 +150,7 @@ class LightningRpc(UnixDomainSocketRpc):
         }
         return self.call("listchannels", payload)
 
-    def invoice(self, msatoshi, label, description, expiry=None):
+    def invoice(self, msatoshi, label, description, expiry=None, fallback=None):
         """
         Create an invoice for {msatoshi} with {label} and {description} with
         optional {expiry} seconds (default 1 hour)
@@ -159,7 +159,8 @@ class LightningRpc(UnixDomainSocketRpc):
             "msatoshi": msatoshi,
             "label": label,
             "description": description,
-            "expiry": expiry
+            "expiry": expiry,
+            "fallback": fallback
         }
         return self.call("invoice", payload)
 
@@ -192,7 +193,7 @@ class LightningRpc(UnixDomainSocketRpc):
         }
         return self.call("waitanyinvoice", payload)
 
-    def waitinvoice(self, label=None):
+    def waitinvoice(self, label):
         """
         Wait for an incoming payment matching the invoice with {label}
         """
@@ -253,15 +254,25 @@ class LightningRpc(UnixDomainSocketRpc):
         """
         return self.call("getinfo")
 
-    def sendpay(self, route, rhash):
+    def sendpay(self, route, payment_hash):
         """
-        Send along {route} in return for preimage of {rhash}
+        Send along {route} in return for preimage of {payment_hash}
         """
         payload = {
             "route": route,
-            "rhash": rhash
+            "payment_hash": payment_hash
         }
         return self.call("sendpay", payload)
+
+    def waitsendpay(self, payment_hash, timeout=None):
+        """
+        Wait for payment for preimage of {payment_hash} to complete
+        """
+        payload = {
+            "payment_hash": payment_hash,
+            "timeout": timeout
+        }
+        return self.call("waitsendpay", payload)
 
     def pay(self, bolt11, msatoshi=None, description=None, riskfactor=None):
         """
@@ -416,3 +427,12 @@ class LightningRpc(UnixDomainSocketRpc):
             "dev-forget-channel",
             payload={"id": peerid, "force": force}
         )
+
+    def disconnect(self, peer_id):
+        """
+        Show peer with {peer_id}, if {level} is set, include {log}s
+        """
+        payload = {
+            "id": peer_id,
+        }
+        return self.call("disconnect", payload)

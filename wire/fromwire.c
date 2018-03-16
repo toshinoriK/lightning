@@ -4,6 +4,7 @@
 #include <bitcoin/shadouble.h>
 #include <bitcoin/tx.h>
 #include <ccan/build_assert/build_assert.h>
+#include <ccan/crypto/siphash24/siphash24.h>
 #include <ccan/endian/endian.h>
 #include <ccan/mem/mem.h>
 #include <ccan/tal/str/str.h>
@@ -82,6 +83,11 @@ u64 fromwire_u64(const u8 **cursor, size_t *max)
 	return be64_to_cpu(ret);
 }
 
+void fromwire_double(const u8 **cursor, size_t *max, double *ret)
+{
+	fromwire(cursor, max, ret, sizeof(*ret));
+}
+
 bool fromwire_bool(const u8 **cursor, size_t *max)
 {
 	u8 ret;
@@ -152,15 +158,7 @@ void fromwire_channel_id(const u8 **cursor, size_t *max,
 void fromwire_short_channel_id(const u8 **cursor, size_t *max,
 			       struct short_channel_id *short_channel_id)
 {
-	be32 txnum = 0, blocknum = 0;
-
-	/* Pulling 3 bytes off wire is tricky; they're big-endian. */
-	fromwire(cursor, max, (char *)&blocknum + 1, 3);
-	short_channel_id->blocknum = be32_to_cpu(blocknum);
-	fromwire(cursor, max, (char *)&txnum + 1, 3);
-	short_channel_id->txnum = be32_to_cpu(txnum);
-
-	short_channel_id->outnum = fromwire_u16 (cursor, max);
+	short_channel_id->u64 = fromwire_u64(cursor, max);
 }
 
 void fromwire_sha256(const u8 **cursor, size_t *max, struct sha256 *sha256)
@@ -250,4 +248,10 @@ struct bitcoin_tx *fromwire_bitcoin_tx(const tal_t *ctx,
 				       const u8 **cursor, size_t *max)
 {
 	return pull_bitcoin_tx(ctx, cursor, max);
+}
+
+void fromwire_siphash_seed(const u8 **cursor, size_t *max,
+			   struct siphash_seed *seed)
+{
+	fromwire(cursor, max, seed, sizeof(*seed));
 }

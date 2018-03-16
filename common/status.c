@@ -18,7 +18,6 @@
 
 static int status_fd = -1;
 static struct daemon_conn *status_conn;
-const void *trc;
 volatile bool logging_io = false;
 
 static void got_sigusr1(int signal UNUSED)
@@ -42,7 +41,6 @@ void status_setup_sync(int fd)
 	assert(status_fd == -1);
 	assert(!status_conn);
 	status_fd = fd;
-	trc = tal_tmpctx(NULL);
 	setup_logging_sighandler();
 }
 
@@ -52,12 +50,10 @@ void status_setup_async(struct daemon_conn *master)
 	assert(!status_conn);
 	status_conn = master;
 
-	/* Don't use tmpctx here, otherwise debug_poll gets upset. */
-	trc = tal(NULL, char);
 	setup_logging_sighandler();
 }
 
-static void status_send(const u8 *msg TAKES)
+void status_send(const u8 *msg TAKES)
 {
 	if (status_fd >= 0) {
 		int type =fromwire_peektype(msg);
@@ -85,7 +81,7 @@ void status_io(enum log_level iodir, const u8 *p)
 	if (logging_io)
 		status_io_full(iodir, p);
 	/* We get a huge amount of gossip; don't log it */
-	else if (!is_gossip_msg(p))
+	else if (!is_msg_for_gossipd(p))
 		status_io_short(iodir, p);
 }
 
@@ -96,12 +92,6 @@ void status_vfmt(enum log_level level, const char *fmt, va_list ap)
 	str = tal_vfmt(NULL, fmt, ap);
 	status_send(take(towire_status_log(NULL, level, str)));
 	tal_free(str);
-
-	/* Free up any temporary children. */
-	if (tal_first(trc)) {
-		tal_free(trc);
-		trc = tal(NULL, char);
-	}
 }
 
 void status_fmt(enum log_level level, const char *fmt, ...)
@@ -161,5 +151,5 @@ void master_badmsg(u32 type_expected, const u8 *msg)
 			     type_expected, strerror(errno));
 	status_failed(STATUS_FAIL_MASTER_IO,
 		     "Error parsing %u: %s",
-		     type_expected, tal_hex(trc, msg));
+		     type_expected, tal_hex(tmpctx, msg));
 }

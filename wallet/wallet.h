@@ -10,11 +10,13 @@
 #include <ccan/tal/tal.h>
 #include <common/channel_config.h>
 #include <common/utxo.h>
+#include <lightningd/chaintopology.h>
 #include <lightningd/htlc_end.h>
 #include <lightningd/invoice.h>
 #include <onchaind/onchain_wire.h>
 #include <wally_bip32.h>
 
+enum onion_type;
 struct invoices;
 struct channel;
 struct lightningd;
@@ -31,6 +33,14 @@ struct wallet {
 	struct invoices *invoices;
 	struct list_head unstored_payments;
 	u64 max_channel_dbid;
+
+	/* Filter matching all outpoints corresponding to our owned outputs,
+	 * including all spent ones */
+	struct outpointfilter *owned_outpoints;
+
+	/* Filter matching all outpoints that might be a funding transaction on
+	 * the blockchain. This is currently all P2WSH outputs */
+	struct outpointfilter *utxoset_outpoints;
 };
 
 /* Possible states for tracked outputs in the database. Not sure yet
@@ -97,6 +107,16 @@ struct wallet_payment {
 	struct secret *path_secrets;
 	struct pubkey *route_nodes;
 	struct short_channel_id *route_channels;
+};
+
+struct outpoint {
+	struct bitcoin_txid txid;
+	u32 blockheight;
+	u32 txindex;
+	u32 outnum;
+	u64 satoshis;
+	u8 *scriptpubkey;
+	u32 spendheight;
 };
 
 /**
@@ -278,7 +298,7 @@ u32 wallet_first_blocknum(struct wallet *w, u32 first_possible);
  * wallet_extract_owned_outputs - given a tx, extract all of our outputs
  */
 int wallet_extract_owned_outputs(struct wallet *w, const struct bitcoin_tx *tx,
-				 u64 *total_satoshi);
+				 const struct block *block, u64 *total_satoshi);
 
 /**
  * wallet_htlc_save_in - store an htlc_in in the database
@@ -368,34 +388,41 @@ enum invoice_status {
 	EXPIRED,
 };
 
-struct invoice {
-	/* Internal, rest of lightningd should not use */
-	/* List off ld->wallet->invoices. Must be first or else
-	 * dev-memleak is driven insane. */
-	struct list_node list;
-	/* Database ID */
-	u64 id;
-	/* Any JSON waitinvoice calls waiting for this to be paid */
-	struct list_head waitone_waiters;
-	/* Any expiration timer in effect */
-	struct oneshot *expiration_timer;
-	/* The owning invoices object. */
-	struct invoices *owner;
-
-	/* Publicly-usable fields. */
+/* The information about an invoice */
+struct invoice_details {
+	/* Current invoice state */
 	enum invoice_status state;
+	/* Preimage for this invoice */
+	struct preimage r;
+	/* Hash of preimage r */
+	struct sha256 rhash;
+	/* Label assigned by user */
 	const char *label;
 	/* NULL if they specified "any" */
 	u64 *msatoshi;
-	/* Set if state == PAID */
-	u64 msatoshi_received;
-	/* Set if state == PAID */
-	u64 paid_timestamp;
-	struct preimage r;
+	/* Absolute UNIX epoch time this will expire */
 	u64 expiry_time;
-	struct sha256 rhash;
-	/* Set if state == PAID */
+	/* Set if state == PAID; order to be returned by waitanyinvoice */
 	u64 pay_index;
+	/* Set if state == PAID; amount received */
+	u64 msatoshi_received;
+	/* Set if state == PAID; time paid */
+	u64 paid_timestamp;
+	/* BOLT11 encoding for this invoice */
+	const char *bolt11;
+};
+
+/* An object that handles iteration over the set of invoices */
+struct invoice_iterator {
+	/* The contents of this object is subject to change
+	 * and should not be depended upon */
+	void *p;
+};
+
+struct invoice {
+	/* Internal, rest of lightningd should not use */
+	/* Database ID */
+	u64 id;
 };
 
 #define INVOICE_MAX_LABEL_LEN 128
@@ -418,6 +445,7 @@ bool wallet_invoice_load(struct wallet *wallet);
  * wallet_invoice_create - Create a new invoice.
  *
  * @wallet - the wallet to create the invoice in.
+ * @pinvoice - pointer to location to load new invoice in.
  * @msatoshi - the amount the invoice should have, or
  * NULL for any-amount invoices.
  * @label - the unique label for this invoice. Must be
@@ -425,36 +453,47 @@ bool wallet_invoice_load(struct wallet *wallet);
  * @expiry - the number of seconds before the invoice
  * expires
  *
- * Returns NULL if label already exists or expiry is 0.
+ * Returns false if label already exists or expiry is 0.
+ * Returns true if created invoice.
  * FIXME: Fallback addresses
  */
-const struct invoice *wallet_invoice_create(struct wallet *wallet,
-					    u64 *msatoshi TAKES,
-					    const char *label TAKES,
-					    u64 expiry);
+bool wallet_invoice_create(struct wallet *wallet,
+			   struct invoice *pinvoice,
+			   u64 *msatoshi TAKES,
+			   const char *label TAKES,
+			   u64 expiry,
+			   const char *b11enc,
+			   const struct preimage *r,
+			   const struct sha256 *rhash);
 
 /**
  * wallet_invoice_find_by_label - Search for an invoice by label
  *
  * @wallet - the wallet to search.
+ * @pinvoice - pointer to location to load found invoice in.
  * @label - the label to search for. Must be null-terminated.
  *
- * Returns NULL if no invoice with that label exists.
+ * Returns false if no invoice with that label exists.
+ * Returns true if found.
  */
-const struct invoice *wallet_invoice_find_by_label(struct wallet *wallet,
-						   const char *label);
+bool wallet_invoice_find_by_label(struct wallet *wallet,
+				  struct invoice *pinvoice,
+				  const char *label);
 
 /**
  * wallet_invoice_find_unpaid - Search for an unpaid, unexpired invoice by
  * payment_hash
  *
  * @wallet - the wallet to search.
+ * @pinvoice - pointer to location to load found invoice in.
  * @rhash - the payment_hash to search for.
  *
- * Returns NULL if no invoice with that payment hash exists.
+ * Returns false if no unpaid invoice with that rhash exists.
+ * Returns true if found.
  */
-const struct invoice *wallet_invoice_find_unpaid(struct wallet *wallet,
-						 const struct sha256 *rhash);
+bool wallet_invoice_find_unpaid(struct wallet *wallet,
+				struct invoice *pinvoice,
+				const struct sha256 *rhash);
 
 /**
  * wallet_invoice_delete - Delete an invoice
@@ -465,24 +504,40 @@ const struct invoice *wallet_invoice_find_unpaid(struct wallet *wallet,
  * Return false on failure.
  */
 bool wallet_invoice_delete(struct wallet *wallet,
-			   const struct invoice *invoice);
+			   struct invoice invoice);
 
 /**
  * wallet_invoice_iterate - Iterate over all existing invoices
  *
  * @wallet - the wallet whose invoices are to be iterated over.
- * @invoice - the previous invoice you iterated over.
+ * @iterator - the iterator object to use.
  *
- * Return NULL at end-of-sequence. Usage:
+ * Return false at end-of-sequence, true if still iterating.
+ * Usage:
  *
- *   const struct invoice *i;
- *   i = NULL;
- *   while ((i = wallet_invoice_iterate(wallet, i))) {
+ *   struct invoice_iterator it;
+ *   memset(&it, 0, sizeof(it))
+ *   while (wallet_invoice_iterate(wallet, &it)) {
  *       ...
  *   }
  */
-const struct invoice *wallet_invoice_iterate(struct wallet *wallet,
-					     const struct invoice *invoice);
+bool wallet_invoice_iterate(struct wallet *wallet,
+			    struct invoice_iterator *it);
+
+/**
+ * wallet_invoice_iterator_deref - Read the details of the
+ * invoice currently pointed to by the given iterator.
+ *
+ * @ctx - the owner of the label and msatoshi fields returned.
+ * @wallet - the wallet whose invoices are to be iterated over.
+ * @iterator - the iterator object to use.
+ * @details - pointer to details object to load.
+ *
+ */
+void wallet_invoice_iterator_deref(const tal_t *ctx,
+				   struct wallet *wallet,
+				   const struct invoice_iterator *it,
+				   struct invoice_details *details);
 
 /**
  * wallet_invoice_resolve - Mark an invoice as paid
@@ -492,10 +547,10 @@ const struct invoice *wallet_invoice_iterate(struct wallet *wallet,
  * @msatoshi_received - the actual amount received.
  *
  * Precondition: the invoice must not yet be expired (wallet
- * does not check).
+ * does not check!).
  */
 void wallet_invoice_resolve(struct wallet *wallet,
-			    const struct invoice *invoice,
+			    struct invoice invoice,
 			    u64 msatoshi_received);
 
 /**
@@ -509,7 +564,8 @@ void wallet_invoice_resolve(struct wallet *wallet,
  * @cb - the callback to invoke. If an invoice is already
  * paid with pay_index greater than lastpay_index, this
  * is called immediately, otherwise it is called during
- * an invoices_resolve call.
+ * an invoices_resolve call. Will never be given a NULL
+ * pointer-to-invoice.
  * @cbarg - the callback data.
  */
 void wallet_invoice_waitany(const tal_t *ctx,
@@ -536,10 +592,22 @@ void wallet_invoice_waitany(const tal_t *ctx,
  */
 void wallet_invoice_waitone(const tal_t *ctx,
 			    struct wallet *wallet,
-			    struct invoice const *invoice,
+			    struct invoice invoice,
 			    void (*cb)(const struct invoice *, void*),
 			    void *cbarg);
 
+/**
+ * wallet_invoice_details - Get the invoice_details of an invoice.
+ *
+ * @ctx - the owner of the label and msatoshi fields returned.
+ * @wallet - the wallet to query.
+ * @invoice - the invoice to get details on.
+ * @details - pointer to details object to load.
+ */
+void wallet_invoice_details(const tal_t *ctx,
+			    struct wallet *wallet,
+			    struct invoice invoice,
+			    struct invoice_details *details);
 
 /**
  * wallet_htlc_stubs - Retrieve HTLC stubs for the given channel
@@ -583,6 +651,17 @@ void wallet_payment_delete(struct wallet *wallet,
 			   const struct sha256 *payment_hash);
 
 /**
+ * wallet_local_htlc_out_delete - Remove a local outgoing failed HTLC
+ *
+ * This is not a generic HTLC cleanup!  This is specifically for the
+ * narrow (and simple!) case of removing the HTLC associated with a
+ * local outgoing payment.
+ */
+void wallet_local_htlc_out_delete(struct wallet *wallet,
+				  struct channel *chan,
+				  const struct sha256 *payment_hash);
+
+/**
  * wallet_payment_by_hash - Retrieve a specific payment
  *
  * Given the `payment_hash` retrieve the matching payment.
@@ -612,6 +691,37 @@ struct secret *wallet_payment_get_secrets(const tal_t *ctx,
 					  const struct sha256 *payment_hash);
 
 /**
+ * wallet_payment_get_failinfo - Get failure information for a given
+ * `payment_hash`.
+ *
+ * Data is allocated as children of the given context.
+ */
+void wallet_payment_get_failinfo(const tal_t *ctx,
+				 struct wallet *wallet,
+				 const struct sha256 *payment_hash,
+				 /* outputs */
+				 u8 **failonionreply,
+				 bool *faildestperm,
+				 int *failindex,
+				 enum onion_type *failcode,
+				 struct pubkey **failnode,
+				 struct short_channel_id **failchannel,
+				 u8 **failupdate);
+/**
+ * wallet_payment_set_failinfo - Set failure information for a given
+ * `payment_hash`.
+ */
+void wallet_payment_set_failinfo(struct wallet *wallet,
+				 const struct sha256 *payment_hash,
+				 const u8 *failonionreply,
+				 bool faildestperm,
+				 int failindex,
+				 enum onion_type failcode,
+				 const struct pubkey *failnode,
+				 const struct short_channel_id *failchannel,
+				 const u8 *failupdate);
+
+/**
  * wallet_payment_list - Retrieve a list of payments
  *
  * payment_hash: optional filter for only this payment hash.
@@ -636,4 +746,29 @@ void wallet_htlc_sigs_save(struct wallet *w, u64 channel_id,
 bool wallet_network_check(struct wallet *w,
 			  const struct chainparams *chainparams);
 
+/**
+ * wallet_block_add - Add a block to the blockchain tracked by this wallet
+ */
+void wallet_block_add(struct wallet *w, struct block *b);
+
+/**
+ * wallet_block_remove - Remove a block (and all its descendants) from the tracked blockchain
+ */
+void wallet_block_remove(struct wallet *w, struct block *b);
+
+/**
+ * wallet_blocks_rollback - Roll the blockchain back to the given height
+ */
+void wallet_blocks_rollback(struct wallet *w, u32 height);
+
+void wallet_outpoint_spend(struct wallet *w, const u32 blockheight,
+			   const struct bitcoin_txid *txid, const u32 outnum);
+
+struct outpoint *wallet_outpoint_for_scid(struct wallet *w, tal_t *ctx,
+					  const struct short_channel_id *scid);
+
+void wallet_utxoset_add(struct wallet *w, const struct bitcoin_tx *tx,
+			const u32 outnum, const u32 blockheight,
+			const u32 txindex, const u8 *scriptpubkey,
+			const u64 satoshis);
 #endif /* WALLET_WALLET_H */

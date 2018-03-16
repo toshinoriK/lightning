@@ -1,4 +1,5 @@
 #include "bitcoin/block.h"
+#include "bitcoin/script.h"
 #include "bitcoin/tx.h"
 #include "bitcoind.h"
 #include "chaintopology.h"
@@ -77,7 +78,7 @@ static void filter_block_txs(struct chain_topology *topo, struct block *b)
 		satoshi_owned = 0;
 		if (txfilter_match(topo->bitcoind->ld->owned_txfilter, tx)) {
 			wallet_extract_owned_outputs(topo->bitcoind->ld->wallet,
-						     tx, &satoshi_owned);
+						     tx, b, &satoshi_owned);
 		}
 
 		/* We did spends first, in case that tells us to watch tx. */
@@ -253,7 +254,7 @@ void broadcast_tx(struct chain_topology *topo,
 	tal_add_destructor2(channel, clear_otx_channel, otx);
 
 	log_add(topo->log, " (tx %s)",
-		type_to_string(ltmp, struct bitcoin_txid, &otx->txid));
+		type_to_string(tmpctx, struct bitcoin_txid, &otx->txid));
 
 	bitcoind_sendrawtx(topo->bitcoind, otx->hextx, broadcast_done, otx);
 }
@@ -348,18 +349,53 @@ static void updates_complete(struct chain_topology *topo)
 	next_topology_timer(topo);
 }
 
+/**
+ * topo_update_spends -- Tell the wallet about all spent outpoints
+ */
+static void topo_update_spends(struct chain_topology *topo, struct block *b)
+{
+	for (size_t i = 0; i < tal_count(b->full_txs); i++) {
+		const struct bitcoin_tx *tx = b->full_txs[i];
+		for (size_t j = 0; j < tal_count(tx->input); j++) {
+			const struct bitcoin_tx_input *input = &tx->input[j];
+			wallet_outpoint_spend(topo->wallet, b->height,
+					      &input->txid,
+					      input->index);
+		}
+	}
+}
+
+static void topo_add_utxos(struct chain_topology *topo, struct block *b)
+{
+	for (size_t i = 0; i < tal_count(b->full_txs); i++) {
+		const struct bitcoin_tx *tx = b->full_txs[i];
+		for (size_t j = 0; j < tal_count(tx->output); j++) {
+			const struct bitcoin_tx_output *output = &tx->output[j];
+			if (is_p2wsh(output->script, NULL)) {
+				wallet_utxoset_add(topo->wallet, tx, j,
+						   b->height, i, output->script,
+						   output->amount);
+			}
+		}
+	}
+}
+
 static void add_tip(struct chain_topology *topo, struct block *b)
 {
-	/* Only keep the transactions we care about. */
-	filter_block_txs(topo, b);
-
-	block_map_add(&topo->block_map, b);
-
 	/* Attach to tip; b is now the tip. */
 	assert(b->height == topo->tip->height + 1);
 	b->prev = topo->tip;
 	topo->tip->next = b;
 	topo->tip = b;
+	wallet_block_add(topo->wallet, b);
+
+	topo_add_utxos(topo, b);
+	topo_update_spends(topo, b);
+
+	/* Only keep the transactions we care about. */
+	filter_block_txs(topo, b);
+
+	block_map_add(&topo->block_map, b);
 }
 
 static struct block *new_block(struct chain_topology *topo,
@@ -371,7 +407,7 @@ static struct block *new_block(struct chain_topology *topo,
 	sha256_double(&b->blkid.shad, &blk->hdr, sizeof(blk->hdr));
 	log_debug(topo->log, "Adding block %u: %s",
 		  height,
-		  type_to_string(ltmp, struct bitcoin_blkid, &b->blkid));
+		  type_to_string(tmpctx, struct bitcoin_blkid, &b->blkid));
 	assert(!block_map_get(&topo->block_map, &b->blkid));
 	b->next = NULL;
 	b->prev = NULL;
@@ -397,12 +433,14 @@ static void remove_tip(struct chain_topology *topo)
 	if (!topo->tip)
 		fatal("Initial block %u (%s) reorganized out!",
 		      b->height,
-		      type_to_string(ltmp, struct bitcoin_blkid, &b->blkid));
+		      type_to_string(tmpctx, struct bitcoin_blkid, &b->blkid));
 
 	/* Notify that txs are kicked out. */
 	for (i = 0; i < n; i++)
 		txwatch_fire(topo, b->txs[i], 0);
 
+	wallet_block_remove(topo->wallet, b);
+	block_map_del(&topo->block_map, b);
 	tal_free(b);
 }
 
@@ -446,6 +484,10 @@ static void init_topo(struct bitcoind *bitcoind UNUSED,
 	block_map_add(&topo->block_map, topo->root);
 	topo->tip = topo->prev_tip = topo->root;
 
+	/* In case we don't get all the way to updates_complete */
+	db_set_intvar(topo->bitcoind->ld->wallet->db,
+		      "last_processed_block", topo->tip->height);
+
 	io_break(topo);
 }
 
@@ -470,6 +512,10 @@ static void get_init_blockhash(struct bitcoind *bitcoind, u32 blockcount,
 		topo->first_blocknum = 0;
 	else
 		topo->first_blocknum -= 100;
+
+	/* Rollback to the given blockheight, so we start track
+	 * correctly again */
+	wallet_blocks_rollback(topo->wallet, topo->first_blocknum - 1);
 
 	/* Get up to speed with topology. */
 	bitcoind_getblockhash(bitcoind, topo->first_blocknum,
@@ -666,7 +712,7 @@ struct chain_topology *new_topology(struct lightningd *ld, struct log *log)
 	topo->default_fee_rate = 40000;
 	topo->override_fee_rate = NULL;
 	topo->bitcoind = new_bitcoind(topo, ld, log);
-
+	topo->wallet = ld->wallet;
 	return topo;
 }
 

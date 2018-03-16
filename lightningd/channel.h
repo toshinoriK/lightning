@@ -8,6 +8,12 @@
 
 struct uncommitted_channel;
 
+struct billboard {
+	/* Status information to display on listpeers */
+	const char *permanent[CHANNEL_STATE_MAX+1];
+	const char *transient;
+};
+
 struct channel {
 	/* Inside peer->channels. */
 	struct list_node list;
@@ -35,6 +41,7 @@ struct channel {
 
 	/* History */
 	struct log *log;
+	struct billboard billboard;
 
 	/* Channel flags from opening message. */
 	u8 channel_flags;
@@ -73,8 +80,8 @@ struct channel {
 
 	/* Their scriptpubkey if they sent shutdown. */
 	u8 *remote_shutdown_scriptpubkey;
-	/* Our key for shutdown (-1 if not chosen yet) */
-	s64 local_shutdown_idx;
+	/* Address for any final outputs */
+	u64 final_key_idx;
 
 	/* Reestablishment stuff: last sent commit and revocation details. */
 	bool last_was_revoke;
@@ -92,6 +99,7 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 			    enum side funder,
 			    /* NULL or stolen */
 			    struct log *log,
+			    const char *transient_billboard TAKES,
 			    u8 channel_flags,
 			    const struct channel_config *our_config,
 			    u32 minimum_depth,
@@ -114,8 +122,7 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 			    const struct channel_info *channel_info,
 			    /* NULL or stolen */
 			    u8 *remote_shutdown_scriptpubkey,
-			    /* (-1 if not chosen yet) */
-			    s64 local_shutdown_idx,
+			    u64 final_key_idx,
 			    bool last_was_revoke,
 			    /* NULL or stolen */
 			    struct changed_htlc *last_sent_commit,
@@ -163,20 +170,9 @@ static inline bool channel_fees_can_change(const struct channel *channel)
 		|| channel->state == CHANNELD_SHUTTING_DOWN;
 }
 
-static inline bool channel_can_remove_htlc(const struct channel *channel)
-{
-	return channel->state == CHANNELD_NORMAL
-		|| channel->state == CHANNELD_SHUTTING_DOWN
-		|| channel->state == ONCHAIND_THEIR_UNILATERAL
-		|| channel->state == ONCHAIND_OUR_UNILATERAL;
-}
-
 static inline bool channel_state_on_chain(enum channel_state state)
 {
-	return state == ONCHAIND_CHEATED
-		|| state == ONCHAIND_THEIR_UNILATERAL
-		|| state == ONCHAIND_OUR_UNILATERAL
-		|| state == ONCHAIND_MUTUAL;
+	return state == ONCHAIN;
 }
 
 static inline bool channel_on_chain(const struct channel *channel)
@@ -199,4 +195,11 @@ static inline bool channel_wants_reconnect(const struct channel *channel)
 void derive_channel_seed(struct lightningd *ld, struct privkey *seed,
 			 const struct pubkey *peer_id,
 			 const u64 dbid);
+
+void channel_set_billboard(struct channel *channel, bool perm,
+			   const char *str TAKES);
+
+struct htlc_in *channel_has_htlc_in(struct channel *channel);
+struct htlc_out *channel_has_htlc_out(struct channel *channel);
+
 #endif /* LIGHTNING_LIGHTNINGD_CHANNEL_H */

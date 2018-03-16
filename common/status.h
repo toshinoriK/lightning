@@ -16,9 +16,6 @@ struct daemon_conn;
 void status_setup_sync(int fd);
 void status_setup_async(struct daemon_conn *master);
 
-/* Convenient context, frees up after every status_update/failed */
-extern const void *trc;
-
 /* Send a printf-style debugging trace. */
 void status_fmt(enum log_level level, const char *fmt, ...)
 	PRINTF_FMT(2,3);
@@ -51,5 +48,6 @@ void status_failed(enum status_failreason code,
  * msg NULL == read failure. */
 void master_badmsg(u32 type_expected, const u8 *msg) NORETURN;
 
+void status_send(const u8 *msg TAKES);
 void status_send_fatal(const u8 *msg TAKES, int fd1, int fd2) NORETURN;
 #endif /* LIGHTNING_COMMON_STATUS_H */

@@ -1,3 +1,4 @@
+#include <bitcoin/script.h>
 #include <ccan/crypto/hkdf_sha256/hkdf_sha256.h>
 #include <ccan/tal/str/str.h>
 #include <gossipd/gen_gossip_wire.h>
@@ -19,34 +20,53 @@ void channel_set_owner(struct channel *channel, struct subd *owner)
 		subd_release_channel(old_owner, channel);
 }
 
-static void destroy_channel(struct channel *channel)
+struct htlc_out *channel_has_htlc_out(struct channel *channel)
 {
-	/* Must not have any HTLCs! */
 	struct htlc_out_map_iter outi;
 	struct htlc_out *hout;
-	struct htlc_in_map_iter ini;
-	struct htlc_in *hin;
 	struct lightningd *ld = channel->peer->ld;
 
 	for (hout = htlc_out_map_first(&ld->htlcs_out, &outi);
 	     hout;
 	     hout = htlc_out_map_next(&ld->htlcs_out, &outi)) {
-		if (hout->key.channel != channel)
-			continue;
-		fatal("Freeing channel %s has hout %s",
-		      channel_state_name(channel),
-		      htlc_state_name(hout->hstate));
+		if (hout->key.channel == channel)
+			return hout;
 	}
+
+	return NULL;
+}
+
+struct htlc_in *channel_has_htlc_in(struct channel *channel)
+{
+	struct htlc_in_map_iter ini;
+	struct htlc_in *hin;
+	struct lightningd *ld = channel->peer->ld;
 
 	for (hin = htlc_in_map_first(&ld->htlcs_in, &ini);
 	     hin;
 	     hin = htlc_in_map_next(&ld->htlcs_in, &ini)) {
-		if (hin->key.channel != channel)
-			continue;
+		if (hin->key.channel == channel)
+			return hin;
+	}
+
+	return NULL;
+}
+
+static void destroy_channel(struct channel *channel)
+{
+	/* Must not have any HTLCs! */
+	struct htlc_out *hout = channel_has_htlc_out(channel);
+	struct htlc_in *hin = channel_has_htlc_in(channel);
+
+	if (hout)
+		fatal("Freeing channel %s has hout %s",
+		      channel_state_name(channel),
+		      htlc_state_name(hout->hstate));
+
+	if (hin)
 		fatal("Freeing channel %s has hin %s",
 		      channel_state_name(channel),
 		      htlc_state_name(hin->hstate));
-	}
 
 	/* Free any old owner still hanging around. */
 	channel_set_owner(channel, NULL);
@@ -103,6 +123,7 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 			    enum side funder,
 			    /* NULL or stolen */
 			    struct log *log,
+			    const char *transient_billboard TAKES,
 			    u8 channel_flags,
 			    const struct channel_config *our_config,
 			    u32 minimum_depth,
@@ -125,8 +146,7 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 			    const struct channel_info *channel_info,
 			    /* NULL or stolen */
 			    u8 *remote_shutdown_scriptpubkey,
-			    /* (-1 if not chosen yet) */
-			    s64 local_shutdown_idx,
+			    u64 final_key_idx,
 			    bool last_was_revoke,
 			    /* NULL or stolen */
 			    struct changed_htlc *last_sent_commit,
@@ -147,6 +167,9 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 	channel->state = state;
 	channel->funder = funder;
 	channel->owner = NULL;
+	memset(&channel->billboard, 0, sizeof(channel->billboard));
+	channel->billboard.transient = tal_strdup(channel, transient_billboard);
+
 	if (!log) {
 		/* FIXME: update log prefix when we get scid */
 		/* FIXME: Use minimal unique pubkey prefix for logs! */
@@ -176,7 +199,7 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 	channel->channel_info = *channel_info;
 	channel->remote_shutdown_scriptpubkey
 		= tal_steal(channel, remote_shutdown_scriptpubkey);
-	channel->local_shutdown_idx = local_shutdown_idx;
+	channel->final_key_idx = final_key_idx;
 	channel->last_was_revoke = last_was_revoke;
 	channel->last_sent_commit = tal_steal(channel, last_sent_commit);
 	channel->first_blocknum = first_blocknum;
@@ -184,6 +207,11 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 
 	list_add_tail(&peer->channels, &channel->list);
 	tal_add_destructor(channel, destroy_channel);
+
+	/* Make sure we see any spends using this key */
+	txfilter_add_scriptpubkey(peer->ld->owned_txfilter,
+				  take(p2wpkh_for_keyidx(NULL, peer->ld,
+							 channel->final_key_idx)));
 
 	return channel;
 }
@@ -265,7 +293,7 @@ void channel_fail_permanent(struct channel *channel, const char *fmt, ...)
 	va_end(ap);
 
 	if (channel->scid) {
-		msg = towire_gossip_disable_channel(channel,
+		msg = towire_gossip_disable_channel(NULL,
 						    channel->scid,
 						    channel->peer->direction,
 						    false);
@@ -314,6 +342,23 @@ void channel_internal_error(struct channel *channel, const char *fmt, ...)
 	tal_free(why);
 }
 
+void channel_set_billboard(struct channel *channel, bool perm, const char *str)
+{
+	const char **p;
+
+	if (perm)
+		p = &channel->billboard.permanent[channel->state];
+	else
+		p = &channel->billboard.transient;
+	*p = tal_free(*p);
+
+	if (str) {
+		*p = tal_fmt(channel, "%s:%s", channel_state_name(channel), str);
+		if (taken(str))
+			tal_free(str);
+	}
+}
+
 void channel_fail_transient(struct channel *channel, const char *fmt, ...)
 {
 	va_list ap;
@@ -345,7 +390,7 @@ void channel_fail_transient(struct channel *channel, const char *fmt, ...)
 		if (ld->no_reconnect)
 			return;
 #endif /* DEVELOPER */
-		u8 *msg = towire_gossipctl_reach_peer(channel,
+		u8 *msg = towire_gossipctl_reach_peer(NULL,
 						      &channel->peer->id);
 		subd_send_msg(ld->gossip, take(msg));
 	}

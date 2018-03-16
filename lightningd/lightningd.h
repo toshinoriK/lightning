@@ -7,8 +7,8 @@
 #include <ccan/time/time.h>
 #include <ccan/timer/timer.h>
 #include <lightningd/htlc_end.h>
-#include <lightningd/txfilter.h>
 #include <stdio.h>
+#include <wallet/txfilter.h>
 #include <wallet/wallet.h>
 
 /* BOLT #1:
@@ -133,6 +133,8 @@ struct lightningd {
 
 	struct wallet *wallet;
 
+	/* Outstanding waitsendpay commands. */
+	struct list_head waitsendpay_commands;
 	/* Outstanding sendpay commands. */
 	struct list_head sendpay_commands;
 
@@ -147,6 +149,9 @@ struct lightningd {
 
 	/* May be useful for non-developers debugging in the field */
 	char *debug_subdaemon_io;
+
+	/* Disable automatic reconnects */
+	bool no_reconnect;
 
 #if DEVELOPER
 	/* If we want to debug a subdaemon. */
@@ -163,13 +168,10 @@ struct lightningd {
 
 	/* Things we've marked as not leaking. */
 	const void **notleaks;
-
-	/* Disable automatic reconnects */
-	bool no_reconnect;
 #endif /* DEVELOPER */
 };
 
-struct chainparams *get_chainparams(const struct lightningd *ld);
+const struct chainparams *get_chainparams(const struct lightningd *ld);
 
 /* State for performing backtraces. */
 struct backtrace_state *backtrace_state;

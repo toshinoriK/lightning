@@ -1,11 +1,15 @@
 /* Code for JSON_RPC API */
 /* eg: { "method" : "dev-echo", "params" : [ "hello", "Arabella!" ], "id" : "1" } */
 #include <arpa/inet.h>
+#include <bitcoin/address.h>
+#include <bitcoin/base58.h>
+#include <bitcoin/script.h>
 #include <ccan/array_size/array_size.h>
 #include <ccan/err/err.h>
 #include <ccan/io/io.h>
 #include <ccan/str/hex/hex.h>
 #include <ccan/tal/str/str.h>
+#include <common/bech32.h>
 #include <common/json.h>
 #include <common/memleak.h>
 #include <common/version.h>
@@ -35,7 +39,7 @@ static void destroy_jcon(struct json_connection *jcon)
 	struct command *cmd;
 
 	list_for_each(&jcon->commands, cmd, list) {
-		log_unusual(jcon->log, "Abandoning command");
+		log_debug(jcon->log, "Abandoning command");
 		cmd->jcon = NULL;
 	}
 
@@ -259,6 +263,9 @@ static void connection_complete_ok(struct json_connection *jcon,
 				   const char *id,
 				   const struct json_result *result)
 {
+	assert(id != NULL);
+	assert(result != NULL);
+
 	/* This JSON is simple enough that we build manually */
 	json_done(jcon, cmd, take(tal_fmt(jcon,
 					  "{ \"jsonrpc\": \"2.0\", "
@@ -274,7 +281,6 @@ static void connection_complete_error(struct json_connection *jcon,
 				      int code,
 				      const struct json_result *data)
 {
-	const tal_t *tmpctx = tal_tmpctx(jcon);
 	/* Use this to escape errmsg. */
 	struct json_result *errorres = new_json_result(tmpctx);
 	const char *data_str;
@@ -286,6 +292,8 @@ static void connection_complete_error(struct json_connection *jcon,
 	else
 		data_str = "";
 
+	assert(id != NULL);
+
 	json_done(jcon, cmd, take(tal_fmt(tmpctx,
 					  "{ \"jsonrpc\": \"2.0\", "
 					  " \"error\" : "
@@ -296,7 +304,6 @@ static void connection_complete_error(struct json_connection *jcon,
 					  json_result_string(errorres),
 					  data_str,
 					  id)));
-	tal_free(tmpctx);
 }
 
 struct json_result *null_response(const tal_t *ctx)
@@ -390,7 +397,7 @@ void command_success(struct command *cmd, struct json_result *result)
 	struct json_connection *jcon = cmd->jcon;
 
 	if (!jcon) {
-		log_unusual(cmd->ld->log,
+		log_debug(cmd->ld->log,
 			    "Command returned result after jcon close");
 		tal_free(cmd);
 		return;
@@ -409,8 +416,8 @@ static void command_fail_v(struct command *cmd,
 	struct json_connection *jcon = cmd->jcon;
 
 	if (!jcon) {
-		log_unusual(cmd->ld->log,
-			    "Command failed after jcon close");
+		log_debug(cmd->ld->log,
+			  "Command failed after jcon close");
 		tal_free(cmd);
 		return;
 	}
@@ -681,7 +688,7 @@ again:
 				    "Invalid token in json input: '%.*s'",
 				    (int)jcon->used, jcon->buffer);
 			json_command_malformed(
-			    jcon, NULL,
+			    jcon, "null",
 			    "Invalid token in json input");
 			return io_halfclose(conn);
 		}
@@ -791,4 +798,118 @@ void setup_jsonrpc(struct lightningd *ld, const char *rpc_filename)
 	log_debug(ld->log, "Listening on '%s'", rpc_filename);
 	/* Technically this is a leak, but there's only one */
 	notleak(io_new_listener(ld, fd, incoming_jcon_connected, ld));
+}
+
+/**
+ * segwit_addr_net_decode - Try to decode a Bech32 address and detect
+ * testnet/mainnet/regtest
+ *
+ * This processes the address and returns a string if it is a Bech32
+ * address specified by BIP173. The string is set whether it is
+ * testnet ("tb"),  mainnet ("bc"), or regtest ("bcrt")
+ * It does not check, witness version and program size restrictions.
+ *
+ *  Out: witness_version: Pointer to an int that will be updated to contain
+ *                 the witness program version (between 0 and 16 inclusive).
+ *       witness_program: Pointer to a buffer of size 40 that will be updated
+ *                 to contain the witness program bytes.
+ *       witness_program_len: Pointer to a size_t that will be updated to
+ *                 contain the length of bytes in witness_program.
+ *  In:  addrz:    Pointer to the null-terminated address.
+ *  Returns string containing the human readable segment of bech32 address
+ */
+static const char* segwit_addr_net_decode(int *witness_version,
+				   uint8_t *witness_program,
+				   size_t *witness_program_len,
+				   const char *addrz)
+{
+	const char *network[] = { "bc", "tb", "bcrt" };
+	for (int i = 0; i < sizeof(network) / sizeof(*network); ++i) {
+		if (segwit_addr_decode(witness_version,
+				       witness_program, witness_program_len,
+				       network[i], addrz))
+			return network[i];
+	}
+
+	return NULL;
+}
+
+enum address_parse_result
+json_tok_address_scriptpubkey(const tal_t *cxt,
+			      const struct chainparams *chainparams,
+			      const char *buffer,
+			      const jsmntok_t *tok, const u8 **scriptpubkey)
+{
+	struct bitcoin_address p2pkh_destination;
+	struct ripemd160 p2sh_destination;
+	int witness_version;
+	/* segwit_addr_net_decode requires a buffer of size 40, and will
+	 * not write to the buffer if the address is too long, so a buffer
+	 * of fixed size 40 will not overflow. */
+	uint8_t witness_program[40];
+	size_t witness_program_len;
+	bool witness_ok;
+
+	char *addrz;
+	const char *bip173;
+
+	bool parsed;
+	bool right_network;
+	bool testnet;
+
+	parsed = false;
+	if (bitcoin_from_base58(&testnet, &p2pkh_destination,
+				buffer + tok->start, tok->end - tok->start)) {
+		*scriptpubkey = scriptpubkey_p2pkh(cxt, &p2pkh_destination);
+		parsed = true;
+		right_network = (testnet == chainparams->testnet);
+	} else if (p2sh_from_base58(&testnet, &p2sh_destination,
+				    buffer + tok->start, tok->end - tok->start)) {
+		*scriptpubkey = scriptpubkey_p2sh_hash(cxt, &p2sh_destination);
+		parsed = true;
+		right_network = (testnet == chainparams->testnet);
+	}
+	/* Insert other parsers that accept pointer+len here. */
+
+	if (parsed) {
+		if (right_network)
+			return ADDRESS_PARSE_SUCCESS;
+		else
+			return ADDRESS_PARSE_WRONG_NETWORK;
+	}
+
+	/* Generate null-terminated address. */
+	addrz = tal_dup_arr(cxt, char, buffer + tok->start, tok->end - tok->start, 1);
+	addrz[tok->end - tok->start] = '\0';
+
+	bip173 = segwit_addr_net_decode(&witness_version, witness_program,
+					&witness_program_len, addrz);
+
+	if (bip173) {
+		witness_ok = false;
+		if (witness_version == 0 && (witness_program_len == 20 ||
+					     witness_program_len == 32)) {
+			witness_ok = true;
+		}
+		/* Insert other witness versions here. */
+
+		if (witness_ok) {
+			*scriptpubkey = scriptpubkey_witness_raw(cxt, witness_version,
+								 witness_program, witness_program_len);
+			parsed = true;
+			right_network = streq(bip173, chainparams->bip173_name);
+		}
+	}
+	/* Insert other parsers that accept null-terminated string here. */
+
+	tal_free(addrz);
+
+	if (parsed) {
+		if (right_network)
+			return ADDRESS_PARSE_SUCCESS;
+		else
+			return ADDRESS_PARSE_WRONG_NETWORK;
+	}
+
+	return ADDRESS_PARSE_UNRECOGNIZED;
 }

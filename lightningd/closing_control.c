@@ -1,3 +1,4 @@
+#include <bitcoin/script.h>
 #include <closingd/gen_closing_wire.h>
 #include <common/close_tx.h>
 #include <common/initial_commit_tx.h>
@@ -111,7 +112,7 @@ static void peer_closing_complete(struct channel *channel, const u8 *msg)
 	channel_set_state(channel, CLOSINGD_SIGEXCHANGE, CLOSINGD_COMPLETE);
 }
 
-static unsigned closing_msg(struct subd *sd, const u8 *msg, const int *fds)
+static unsigned closing_msg(struct subd *sd, const u8 *msg, const int *fds UNUSED)
 {
 	enum closing_wire_type t = fromwire_peektype(msg);
 
@@ -139,22 +140,15 @@ void peer_start_closingd(struct channel *channel,
 			 int peer_fd, int gossip_fd,
 			 bool reconnected)
 {
-	const tal_t *tmpctx = tal_tmpctx(channel);
-	u8 *initmsg, *local_scriptpubkey;
+	u8 *initmsg;
 	u64 minfee, startfee, feelimit;
 	u64 num_revocations;
 	u64 funding_msatoshi, our_msatoshi, their_msatoshi;
 	struct lightningd *ld = channel->peer->ld;
 
-	if (channel->local_shutdown_idx == -1
-	    || !channel->remote_shutdown_scriptpubkey) {
+	if (!channel->remote_shutdown_scriptpubkey) {
 		channel_internal_error(channel,
-				    "Can't start closing: local %s remote %s",
-				    channel->local_shutdown_idx == -1
-				    ? "not shutdown" : "shutdown",
-				    channel->remote_shutdown_scriptpubkey
-				    ? "shutdown" : "not shutdown");
-		tal_free(tmpctx);
+				       "Can't start closing: no remote info");
 		return;
 	}
 
@@ -163,22 +157,13 @@ void peer_start_closingd(struct channel *channel,
 					   channel, channel->log,
 					   closing_wire_type_name, closing_msg,
 					   channel_errmsg,
+					   channel_set_billboard,
 					   take(&peer_fd), take(&gossip_fd),
 					   NULL));
 	if (!channel->owner) {
 		log_unusual(channel->log, "Could not subdaemon closing: %s",
 			    strerror(errno));
 		channel_fail_transient(channel, "Failed to subdaemon closing");
-		tal_free(tmpctx);
-		return;
-	}
-
-	local_scriptpubkey = p2wpkh_for_keyidx(tmpctx, ld,
-					       channel->local_shutdown_idx);
-	if (!local_scriptpubkey) {
-		channel_internal_error(channel,
-				    "Can't generate local shutdown scriptpubkey");
-		tal_free(tmpctx);
 		return;
 	}
 
@@ -226,7 +211,8 @@ void peer_start_closingd(struct channel *channel,
 				      their_msatoshi / 1000, /* Rounds down */
 				      channel->our_config.dust_limit_satoshis,
 				      minfee, feelimit, startfee,
-				      local_scriptpubkey,
+				      p2wpkh_for_keyidx(tmpctx, ld,
+							channel->final_key_idx),
 				      channel->remote_shutdown_scriptpubkey,
 				      reconnected,
 				      channel->next_index[LOCAL],
@@ -237,5 +223,4 @@ void peer_start_closingd(struct channel *channel,
 	/* We don't expect a response: it will give us feedback on
 	 * signatures sent and received, then closing_complete. */
 	subd_send_msg(channel->owner, take(initmsg));
-	tal_free(tmpctx);
 }
